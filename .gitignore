@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Compiled output
+out/
+*.js.map
+
+# Packaged extension (distributed via GitHub Releases, not committed)
+*.vsix
+
+# Local EFx workspace data (pulled function code — never commit these)
+.efx/
+
+# VS Code local settings
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+.vscode/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript build info
+*.tsbuildinfo

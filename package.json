@@ -1,0 +1,349 @@
+{
+	"name": "epicor-efx-manager",
+	"displayName": "Epicor EFx Manager",
+	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
+	"version": "0.3.0",
+	"publisher": "micah-bragg",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [],
+	"main": "./out/extension.js",
+	"contributes": {
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "efx-explorer",
+					"title": "EFx Explorer",
+					"icon": "$(symbol-function)"
+				}
+			]
+		},
+		"views": {
+			"efx-explorer": [
+				{
+					"id": "efxLibraries",
+					"name": "EFx Libraries"
+				},
+				{
+					"id": "bpmMethods",
+					"name": "BPM Methods"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "efx.regenerateLibrary",
+				"title": "Regenerate / Validate Library",
+				"icon": "$(check)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.refreshLibraries",
+				"title": "Refresh Libraries",
+				"icon": "$(refresh)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.configureConnection",
+				"title": "Configure Connection (Manage Profiles)",
+				"icon": "$(gear)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.manageProfiles",
+				"title": "Manage Profiles",
+				"icon": "$(gear)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.switchProfile",
+				"title": "Switch Profile",
+				"icon": "$(arrow-swap)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.switchCompany",
+				"title": "Switch Company",
+				"icon": "$(organization)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.pullFunction",
+				"title": "Pull Function Code",
+				"icon": "$(cloud-download)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.pushFunction",
+				"title": "Push Function Code",
+				"icon": "$(cloud-upload)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.executeFunction",
+				"title": "Execute Function",
+				"icon": "$(play)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.demoteLibrary",
+				"title": "Demote from Production",
+				"icon": "$(arrow-down)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.promoteLibrary",
+				"title": "Promote to Production",
+				"icon": "$(arrow-up)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.newFunction",
+				"title": "New Function",
+				"icon": "$(add)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.deleteFunction",
+				"title": "Delete Function",
+				"icon": "$(trash)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.newLibrary",
+				"title": "New Library",
+				"icon": "$(new-folder)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.addTable",
+				"title": "Add Table Reference",
+				"icon": "$(add)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.addService",
+				"title": "Add Service Reference",
+				"icon": "$(add)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.addAssembly",
+				"title": "Add Assembly Reference",
+				"icon": "$(add)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.addLibraryRef",
+				"title": "Add Library Reference",
+				"icon": "$(add)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.bpm.refresh",
+				"title": "Refresh BPM Methods",
+				"icon": "$(refresh)",
+				"category": "BPM"
+			},
+			{
+				"command": "efx.bpm.pullDirective",
+				"title": "Pull Directive Code",
+				"icon": "$(cloud-download)",
+				"category": "BPM"
+			},
+			{
+				"command": "efx.bpm.pushDirective",
+				"title": "Push Directive Code",
+				"icon": "$(cloud-upload)",
+				"category": "BPM"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "efx.refreshLibraries",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.configureConnection",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.switchProfile",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.switchCompany",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.newLibrary",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.bpm.refresh",
+					"when": "view == bpmMethods",
+					"group": "navigation"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "efx.pullFunction",
+					"when": "view == efxLibraries && viewItem == function",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.executeFunction",
+					"when": "view == efxLibraries && viewItem == function",
+					"group": "inline@2"
+				},
+				{
+					"command": "efx.pushFunction",
+					"when": "view == efxLibraries && viewItem == function",
+					"group": "inline@3"
+				},
+				{
+					"command": "efx.deleteFunction",
+					"when": "view == efxLibraries && viewItem == function",
+					"group": "danger@1"
+				},
+				{
+					"command": "efx.newFunction",
+					"when": "view == efxLibraries && viewItem == library-unpromoted",
+					"group": "navigation@1"
+				},
+				{
+					"command": "efx.newFunction",
+					"when": "view == efxLibraries && viewItem == function-group",
+					"group": "navigation@1"
+				},
+				{
+					"command": "efx.promoteLibrary",
+					"when": "view == efxLibraries && viewItem == library-unpromoted",
+					"group": "navigation@2"
+				},
+				{
+					"command": "efx.demoteLibrary",
+					"when": "view == efxLibraries && viewItem == library-promoted",
+					"group": "navigation@3"
+				},
+				{
+					"command": "efx.addTable",
+					"when": "view == efxLibraries && viewItem == reference-group-tables",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.addService",
+					"when": "view == efxLibraries && viewItem == reference-group-services",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.addAssembly",
+					"when": "view == efxLibraries && viewItem == reference-group-assemblies",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.addLibraryRef",
+					"when": "view == efxLibraries && viewItem == reference-group-libraries",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.bpm.pullDirective",
+					"when": "view == bpmMethods && viewItem == bpm-directive-code",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.bpm.pushDirective",
+					"when": "view == bpmMethods && viewItem == bpm-directive-code",
+					"group": "inline@2"
+				},
+				{
+					"command": "efx.regenerateLibrary",
+					"when": "view == efxLibraries && (viewItem == library-unpromoted || viewItem == library-promoted)",
+					"group": "navigation@4"
+				}
+			],
+			"commandPalette": [
+				{
+					"command": "efx.switchCompany",
+					"when": "false"
+				},
+				{
+					"command": "efx.deleteFunction",
+					"when": "false"
+				}
+			]
+		},
+		"configuration": {
+			"title": "Epicor EFx Manager",
+			"properties": {
+				"efx.profiles": {
+					"type": "array",
+					"default": [],
+					"description": "Configured Epicor environment profiles. Manage via the EFx: Manage Profiles command — passwords and API keys are stored in SecretStorage, not here.",
+					"items": {
+						"type": "object",
+						"required": [
+							"name",
+							"serverUrl",
+							"username",
+							"companies"
+						],
+						"properties": {
+							"name": {
+								"type": "string",
+								"description": "Profile display name (e.g. Dev, Prod, Pilot)"
+							},
+							"serverUrl": {
+								"type": "string",
+								"description": "Epicor server base URL"
+							},
+							"username": {
+								"type": "string",
+								"description": "Epicor username"
+							},
+							"companies": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"description": "Allowed company codes for this profile"
+							}
+						}
+					}
+				},
+				"efx.activeProfile": {
+					"type": "string",
+					"default": "",
+					"description": "Name of the currently active profile"
+				},
+				"efx.activeCompany": {
+					"type": "string",
+					"default": "",
+					"description": "Currently selected company within the active profile"
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "echo no build step",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"package": "npx @vscode/vsce package"
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"@types/vscode": "^1.85.0",
+		"@vscode/vsce": "^2.32.0",
+		"typescript": "^5.3.0"
+	}
+}
