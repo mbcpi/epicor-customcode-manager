@@ -133,6 +133,7 @@ In the Execute panel, click **⚙ Edit Signatures** to open the signature editor
 - REST API access to your Epicor server
 - Your Epicor user must have access to `Ice.LIB.EfxLibraryDesignerSvc`
 - To use the push/save path via the `Utilities` wrapper library, your user needs EFx execute access to `Utilities.ApplyChangesWithDiagnostics` — if not, the extension falls back to the direct designer service endpoint automatically
+- the Utilities wrapper library MUST REMAIN PUBLISHED
 
 ---
 
