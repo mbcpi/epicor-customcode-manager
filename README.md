@@ -184,5 +184,5 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 ## Known Limitations
 
 - The extension does not support widget-based functions (Kind 0) — only code-based (Kind 2) and widget+code (Kind 1)
-- Signature editor does not support `DataSet`/`DataTable` parameter types via the dropdown — use the "Custom…" option and enter the full .NET type name
+- Signature editor does not support `DataSet`/`DataTable` parameter types via the dropdown — use the "Custom…" option and enter the full .NET type name I.E. System.Data.DataSet or Erp.Tablesets.SalesOrderTableset
 - BPM directives without custom C# code (widget-only) are shown but cannot be pulled/pushed
