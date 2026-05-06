@@ -11,12 +11,19 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 - **Browse** all EFx libraries and their functions in the EFx Explorer sidebar
 - **Pull** function C# code into a local `.cs` file with one click
 - **Push** edited code back to Epicor with live compile diagnostics shown as VS Code squiggles
+- **Auto-push on save** — enable per-profile to automatically push every time you save a `.cs` file
 - **Execute** functions directly from VS Code with a built-in request/response panel
+  - Automatically routes unpromoted (staging) libraries through `/api/v2/efx/staging/...`
+  - Copy response to clipboard with one click
+  - DataSet/tableset responses render as a parsed table
 - **Edit Signatures** — add, remove, or modify request and response parameters and save them directly to Epicor
+  - `System.Data.DataSet` and `System.Data.DataTable` available in the type dropdown directly
 - **Create** new libraries and functions
+  - Add request and response parameters inline during function creation
 - **Promote / Demote** libraries to/from production
 - **Regenerate / Validate** libraries
 - **Manage references** — tables, services, assemblies, and library references
+  - Plus `+` button on the Functions group matches the UX of table/service/assembly groups
 
 ### BPM Directives
 
@@ -30,6 +37,7 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 - Switch between profiles and companies instantly from the toolbar
 - Passwords and API keys stored securely in VS Code SecretStorage — never in settings files
 - Auto-discovers available companies from the server via the UserFile service
+- **Auto-push** setting per profile — toggle in profile setup
 
 ---
 
@@ -159,6 +167,15 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 
 ## Changelog
 
+### 0.4.0
+- **Staging execute** — unpromoted libraries automatically execute via `/api/v2/efx/staging/...` instead of the production endpoint
+- **`+` button on Functions group** — add a new function directly from the Functions group header, consistent with table/service/assembly groups
+- **Auto-push on save** — new profile setting; when enabled, saving a `.cs` file immediately pushes it to Epicor without a confirmation dialog
+- **Params on function creation** — optionally add request and response parameters inline during `New Function`, no need to open Execute panel after
+- **Copy response button** — one-click copy of the raw response JSON in the Execute panel
+- **DataSet response parser** — if the response is a tableset/DataSet shape, a rendered table view is shown alongside the raw JSON
+- **`System.Data.DataSet` / `System.Data.DataTable` in type dropdown** — no longer requires the "Custom…" workaround
+
 ### 0.3.0
 - **Signature editor** — add, edit, and remove request/response parameters directly from the Execute panel and save them to Epicor
 - **Multi-company execute** — select which company to execute a function against from the Execute panel
@@ -185,5 +202,4 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 ## Known Limitations
 
 - The extension does not support widget-based functions (Kind 0) — only code-based (Kind 2) and widget+code (Kind 1)
-- Signature editor does not support `DataSet`/`DataTable` parameter types via the dropdown — use the "Custom…" option and enter the full .NET type name I.E. System.Data.DataSet or Erp.Tablesets.SalesOrderTableset
 - BPM directives without custom C# code (widget-only) are shown but cannot be pulled/pushed

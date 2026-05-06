@@ -59,9 +59,12 @@ class EpicorClient {
         return `${base}/api/v2/odata/${this.config.company}/Ice.LIB.EfxLibraryDesignerSvc/${method}`;
     }
 
-    getEfxUrl(libraryId, functionId, companyOverride) {
+    getEfxUrl(libraryId, functionId, companyOverride, staging = false) {
         const base = this.config.serverUrl.replace(/\/$/, '');
         const company = companyOverride || this.config.company;
+        if (staging) {
+            return `${base}/api/v2/efx/staging/${company}/${libraryId}/${functionId}`;
+        }
         return `${base}/api/v2/efx/${company}/${libraryId}/${functionId}`;
     }
 
@@ -535,8 +538,8 @@ class EpicorClient {
         return objStr.slice(0, vStart) + newJsonLiteral + objStr.slice(vEnd + 1);
     }
 
-    async executeFunction(libraryId, functionId, requestParams, companyOverride) {
-        const url = this.getEfxUrl(libraryId, functionId, companyOverride);
+    async executeFunction(libraryId, functionId, requestParams, companyOverride, staging = false) {
+        const url = this.getEfxUrl(libraryId, functionId, companyOverride, staging);
         return this.request(url, requestParams);
     }
 

@@ -29,3 +29,5 @@ npm-debug.log*
 .vsixmanifest
 efx_validate_payload.json
 node_modules/
+*.vsix
+*.vsix.zip
