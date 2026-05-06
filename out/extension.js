@@ -794,11 +794,26 @@ function activate(context) {
 
                     // ── Save signatures if user supplied any ──
                     if (allSigs.length > 0) {
-                        try {
-                            await client.saveSignatures(libraryId, functionId, allSigs);
+                        // Retry a few times — Epicor may not have committed the new
+                        // function row by the time we immediately call getLibraryRaw
+                        let sigSaved = false;
+                        let sigErr = null;
+                        for (let attempt = 0; attempt < 4; attempt++) {
+                            if (attempt > 0) {
+                                await new Promise(r => setTimeout(r, 800 * attempt));
+                            }
+                            try {
+                                await client.saveSignatures(libraryId, functionId, allSigs);
+                                sigSaved = true;
+                                break;
+                            } catch (e) {
+                                sigErr = e;
+                            }
+                        }
+                        if (sigSaved) {
                             vscode.window.showInformationMessage(`EFx: Saved ${allSigs.length} parameter(s) for ${functionId} ✓`);
-                        } catch (sigErr) {
-                            vscode.window.showWarningMessage(`EFx: Function created but signatures failed: ${sigErr.message}`);
+                        } else {
+                            vscode.window.showWarningMessage(`EFx: Function created but signatures failed: ${sigErr?.message}. Add them via ⚙ Edit Signatures in the Execute panel.`);
                         }
                     }
 
