@@ -43,6 +43,7 @@ const treeProvider_1 = require("./treeProvider");
 const executePanel_1 = require("./executePanel");
 const bpmClient_1 = require("./bpmClient");
 const bpmTreeProvider_1 = require("./bpmTreeProvider");
+const updater_1 = require("./updater");
 // Store pulled tablesets for push-back/debugging.
 const pulledTablesets = new Map();
 // Map open .cs files back to their library/function.
@@ -277,6 +278,9 @@ function activate(context) {
     context.subscriptions.push(bpmMethodsView);
     // Try to initialize client from settings + secrets.
     initClient(context).then(() => updateViewDescriptions());
+    // ── Auto-update: check GitHub releases on startup + manual command ──
+    updater_1.registerUpdateCommand(context);
+    updater_1.checkForUpdatesOnStartup(context);
     // -- Manage Profiles (entry point — also aliased as Configure Connection) --
     const manageProfilesHandler = async () => {
         await openProfileManager(context);
@@ -355,7 +359,7 @@ function activate(context) {
         });
     }));
     // -- Push Function --
-    context.subscriptions.push(vscode.commands.registerCommand("efx.pushFunction", async (node) => {
+    context.subscriptions.push(vscode.commands.registerCommand("efx.pushFunction", async (node, skipConfirm = false) => {
         if (!client) {
             return;
         }
@@ -388,9 +392,11 @@ function activate(context) {
             vscode.window.showErrorMessage("EFx: File not found. Pull the function first.");
             return;
         }
-        const confirm = await vscode.window.showWarningMessage(`Push ${functionId} to ${libraryId}?`, { modal: true }, "Push");
-        if (confirm !== "Push") {
-            return;
+        if (!skipConfirm) {
+            const confirm = await vscode.window.showWarningMessage(`Push ${functionId} to ${libraryId}?`, { modal: true }, "Push");
+            if (confirm !== "Push") {
+                return;
+            }
         }
         await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: `Pushing ${functionId}...` },
@@ -573,7 +579,10 @@ function activate(context) {
         const profile = getActiveProfile();
         const companies = profile ? (profile.companies || []) : [];
         const defaultCompany = getActiveCompany() || (companies[0] || '');
-        executePanel_1.ExecutePanel.show(client, node.libraryId, node.func.FunctionID, node.signatures, companies, defaultCompany, treeProvider);
+        // Determine if this library is unpromoted (staging) so execute uses the right URL
+        const libMeta = (treeProvider.libraries || []).find(l => l.LibraryID === node.libraryId);
+        const staging = libMeta ? !libMeta.Published : false;
+        executePanel_1.ExecutePanel.show(client, node.libraryId, node.func.FunctionID, node.signatures, companies, defaultCompany, treeProvider, staging);
     }));
     // -- Demote Library --
     context.subscriptions.push(vscode.commands.registerCommand("efx.demoteLibrary", async (node) => {
@@ -647,6 +656,58 @@ function activate(context) {
             prompt: 'Description (optional)',
             placeHolder: 'Short description of the function',
         });
+
+        // ── Collect request/response params before creating ──
+        const PARAM_TYPES = [
+            'string', 'int', 'decimal', 'bool', 'DateTime',
+            'System.Data.DataSet', 'System.Data.DataTable', 'Custom…'
+        ];
+
+        async function collectParams(label) {
+            const params = [];
+            while (true) {
+                const argName = await vscode.window.showInputBox({
+                    prompt: `${label} param name (leave blank to finish)`,
+                    placeHolder: 'e.g. partNum',
+                    ignoreFocusOut: true,
+                });
+                if (!argName) break;
+                const typePick = await vscode.window.showQuickPick(
+                    PARAM_TYPES.map(t => ({ label: t })),
+                    { placeHolder: `Data type for "${argName}"`, ignoreFocusOut: true }
+                );
+                if (!typePick) break;
+                let dataType = typePick.label;
+                if (dataType === 'Custom…') {
+                    const custom = await vscode.window.showInputBox({
+                        prompt: 'Enter full .NET type name',
+                        placeHolder: 'e.g. Erp.Tablesets.SalesOrderTableset',
+                        ignoreFocusOut: true,
+                    });
+                    if (!custom) break;
+                    dataType = custom;
+                }
+                params.push({ ArgumentName: argName, DataType: dataType });
+            }
+            return params;
+        }
+
+        const addReqPick = await vscode.window.showQuickPick(
+            [{ label: 'Skip — add later', value: false }, { label: 'Add request params now', value: true }],
+            { placeHolder: 'Add request parameters?', ignoreFocusOut: true }
+        );
+        const requestParams = (addReqPick?.value) ? await collectParams('Request') : [];
+
+        const addRespPick = await vscode.window.showQuickPick(
+            [{ label: 'Skip — add later', value: false }, { label: 'Add response params now', value: true }],
+            { placeHolder: 'Add response parameters?', ignoreFocusOut: true }
+        );
+        const responseParams = (addRespPick?.value) ? await collectParams('Response') : [];
+
+        const allSigs = [
+            ...requestParams.map((p, i) => ({ ...p, Response: false, Order: i })),
+            ...responseParams.map((p, i) => ({ ...p, Response: true, Order: i })),
+        ];
 
         await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: `Creating ${functionId}...` },
@@ -729,6 +790,16 @@ function activate(context) {
                         vscode.window.showWarningMessage(`EFx: ${functionId} created with diagnostics:\n${diagMsg}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Created ${libraryId}.${functionId} ✓`);
+                    }
+
+                    // ── Save signatures if user supplied any ──
+                    if (allSigs.length > 0) {
+                        try {
+                            await client.saveSignatures(libraryId, functionId, allSigs);
+                            vscode.window.showInformationMessage(`EFx: Saved ${allSigs.length} parameter(s) for ${functionId} ✓`);
+                        } catch (sigErr) {
+                            vscode.window.showWarningMessage(`EFx: Function created but signatures failed: ${sigErr.message}`);
+                        }
                     }
 
                     treeProvider.invalidateCache(libraryId);
@@ -1286,6 +1357,17 @@ function activate(context) {
         //ApplyChangesWithDiagnostics with RowMod:"" causes:
         // "Can't infer library ID from the input"
         // Use efx.regenerateLibrary instead.
+    }));
+
+    // ── Auto-push on save (if enabled in profile) ──
+    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(async (doc) => {
+        const filePath = doc.uri.fsPath;
+        const mapping = fileMap.get(normalizeFsPath(filePath));
+        if (!mapping || mapping.isBpm || !client) return;
+        const activeProfile = getActiveProfile();
+        if (!activeProfile?.autoPush) return;
+        // Fire push silently — skipConfirm=true so no modal dialog
+        await vscode.commands.executeCommand('efx.pushFunction', null, true);
     }));
 
     // Clear diagnostics when BPM file is closed
@@ -1922,6 +2004,17 @@ async function runProfileEditor(context, draft, isNew) {
     const companiesResult = await resolveCompanies(context, draft, resolvedPassword, resolvedApiKey);
     if (companiesResult === undefined) return false;
     draft.companies = companiesResult;
+
+    // Step 7: auto-push on save
+    const autoPushPick = await vscode.window.showQuickPick(
+        [
+            { label: "No — push manually", value: false },
+            { label: "Yes — auto-push on file save", value: true },
+        ],
+        { placeHolder: "Auto-push changes to Epicor when you save a .cs file?", ignoreFocusOut: true }
+    );
+    if (autoPushPick === undefined) return false;
+    draft.autoPush = autoPushPick.value;
 
     return true;
 }

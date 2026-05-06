@@ -36,7 +36,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ExecutePanel = void 0;
 const vscode = __importStar(require("vscode"));
 class ExecutePanel {
-    constructor(panel, client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider) {
+    constructor(panel, client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging = false) {
         this.client = client;
         this.libraryId = libraryId;
         this.functionId = functionId;
@@ -44,6 +44,7 @@ class ExecutePanel {
         this.companies = Array.isArray(companies) && companies.length > 0 ? companies : (defaultCompany ? [defaultCompany] : []);
         this.defaultCompany = defaultCompany || (this.companies[0] || '');
         this.treeProvider = treeProvider || null;
+        this.staging = staging;
         this.disposed = false;
         this.panel = panel;
         this.panel.webview.onDidReceiveMessage(async (msg) => {
@@ -60,7 +61,7 @@ class ExecutePanel {
         });
         this.panel.webview.html = this.getHtml();
     }
-    static show(client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider) {
+    static show(client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging = false) {
         const key = `${libraryId}.${functionId}`;
         const existing = ExecutePanel.panels.get(key);
         if (existing && !existing.disposed) {
@@ -68,13 +69,13 @@ class ExecutePanel {
             return;
         }
         const panel = vscode.window.createWebviewPanel('efxExecute', `▶ ${functionId}`, vscode.ViewColumn.Two, { enableScripts: true, retainContextWhenHidden: true });
-        const ep = new ExecutePanel(panel, client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider);
+        const ep = new ExecutePanel(panel, client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging);
         ExecutePanel.panels.set(key, ep);
     }
     async execute(payload, company) {
         this.panel.webview.postMessage({ command: 'executing' });
         try {
-            const result = await this.client.executeFunction(this.libraryId, this.functionId, payload, company || undefined);
+            const result = await this.client.executeFunction(this.libraryId, this.functionId, payload, company || undefined, this.staging);
             this.panel.webview.postMessage({
                 command: 'result',
                 data: JSON.stringify(result, null, 2),
@@ -164,13 +165,14 @@ class ExecutePanel {
             Response: !!s.Response,
             Order: s.Order ?? 0,
         });
-        const reqSigsJson  = JSON.stringify(requestParams.map(toEditorSig));
+        const reqSigsJson = JSON.stringify(requestParams.map(toEditorSig));
         const respSigsJson = JSON.stringify(responseParams.map(toEditorSig));
         const typeOptionsHtml = [
-            ['System.String','String'],['System.Int32','Int32'],['System.Int64','Int64'],
-            ['System.Decimal','Decimal'],['System.Double','Double'],
-            ['System.Boolean','Boolean'],['System.DateTime','DateTime'],
-        ].map(([v,l]) => `<option value="${v}">${l}</option>`).join('') + '<option value="__custom__">Custom…</option>';
+            ['System.String', 'String'], ['System.Int32', 'Int32'], ['System.Int64', 'Int64'],
+            ['System.Decimal', 'Decimal'], ['System.Double', 'Double'],
+            ['System.Boolean', 'Boolean'], ['System.DateTime', 'DateTime'],
+            ['System.Data.DataSet', 'DataSet'], ['System.Data.DataTable', 'DataTable'],
+        ].map(([v, l]) => `<option value="${v}">${l}</option>`).join('') + '<option value="__custom__">Custom…</option>';
         return /*html*/ `<!DOCTYPE html>
 <html>
 <head>
@@ -347,12 +349,61 @@ class ExecutePanel {
     .btn-save { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; padding: 5px 14px; font-size: 12px; font-weight: 600; cursor: pointer; }
     .btn-save:hover { background: var(--vscode-button-hoverBackground); }
     .btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
+    .staging-badge {
+        background: var(--vscode-statusBarItem-warningBackground, #cc6600);
+        color: var(--vscode-statusBarItem-warningForeground, #fff);
+        font-size: 10px; font-weight: 700; padding: 2px 7px;
+        border-radius: 3px; letter-spacing: 0.4px; text-transform: uppercase;
+    }
+    .response-header {
+        display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+    }
+    .response-header h2 { margin-bottom: 0; }
+    .btn-copy {
+        background: transparent;
+        color: var(--vscode-descriptionForeground);
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 3px; padding: 2px 8px; font-size: 11px; font-weight: 600;
+        cursor: pointer; margin-top: 0;
+    }
+    .btn-copy:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.1)); }
+    .btn-copy.copied { color: var(--vscode-testing-iconPassed); border-color: var(--vscode-testing-iconPassed); }
+    .dataset-table-wrap {
+        margin-top: 10px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; overflow: hidden;
+    }
+    .dataset-tabs {
+        display: flex; background: var(--vscode-sideBarSectionHeader-background, rgba(255,255,255,0.04));
+        border-bottom: 1px solid var(--vscode-panel-border); flex-wrap: wrap;
+    }
+    .dataset-tab {
+        padding: 5px 14px; font-size: 11px; font-weight: 600; cursor: pointer;
+        border: none; background: transparent; color: var(--vscode-descriptionForeground);
+        border-bottom: 2px solid transparent; margin-bottom: -1px;
+    }
+    .dataset-tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-button-background); }
+    .dataset-table-container { overflow-x: auto; max-height: 300px; overflow-y: auto; }
+    table.dataset-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+    table.dataset-table th {
+        background: var(--vscode-sideBarSectionHeader-background, rgba(255,255,255,0.06));
+        padding: 5px 10px; text-align: left; font-weight: 600; font-size: 11px;
+        border-bottom: 1px solid var(--vscode-panel-border);
+        white-space: nowrap; position: sticky; top: 0;
+    }
+    table.dataset-table td {
+        padding: 4px 10px; border-bottom: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.06));
+        max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        font-family: var(--vscode-editor-font-family); font-size: 12px;
+    }
+    table.dataset-table tr:last-child td { border-bottom: none; }
+    table.dataset-table tr:hover td { background: var(--vscode-list-hoverBackground); }
+    .dataset-empty { padding: 10px; font-size: 12px; color: var(--vscode-descriptionForeground); font-style: italic; }
 </style>
 </head>
 <body>
     <div class="header">
         <h1>▶ ${this.functionId}</h1>
         <span class="lib">${this.libraryId}</span>
+        ${this.staging ? '<span class="staging-badge">staging</span>' : ''}
     </div>
 
     ${companyRow}
@@ -388,13 +439,18 @@ class ExecutePanel {
     <span class="spinner" id="spinner">⏳ Running...</span>
 
     <div class="response-area">
-        <h2>Response</h2>
+        <div class="response-header">
+            <h2>Response</h2>
+            <button class="btn-copy" id="copyBtn" onclick="copyResponse()" title="Copy response to clipboard">⎘ Copy</button>
+        </div>
         <div class="params">${responseInfo}</div>
         <pre id="response">— No response yet —</pre>
+        <div id="datasetWrap" class="dataset-table-wrap" style="display:none"></div>
     </div>
 
     <script>
         const vscode = acquireVsCodeApi();
+        const staging = ${this.staging ? 'true' : 'false'};
 
         let reqSigs  = ${reqSigsJson};
         let respSigs = ${respSigsJson};
@@ -413,7 +469,11 @@ class ExecutePanel {
             document.getElementById('tabResp').className = 'sig-tab' + (tab === 'response' ? ' active' : '');
             renderSigRows();
         }
-        const knownTypes = ['System.String','System.Int32','System.Int64','System.Decimal','System.Double','System.Boolean','System.DateTime'];
+        const knownTypes = [
+            'System.String','System.Int32','System.Int64','System.Decimal',
+            'System.Double','System.Boolean','System.DateTime',
+            'System.Data.DataSet','System.Data.DataTable'
+        ];
         function renderSigRows() {
             const sigs = activeTab === 'request' ? reqSigs : respSigs;
             const container = document.getElementById('sigRows');
@@ -429,7 +489,7 @@ class ExecutePanel {
                 const typeCell = document.createElement('div');
                 typeCell.className = 'type-cell';
                 const typeSelect = document.createElement('select');
-                knownTypes.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t.replace('System.',''); if (t === sig.DataType) o.selected = true; typeSelect.appendChild(o); });
+                knownTypes.forEach(t => { const o = document.createElement('option'); o.value = t; o.textContent = t.replace('System.Data.','').replace('System.',''); if (t === sig.DataType) o.selected = true; typeSelect.appendChild(o); });
                 const customOpt = document.createElement('option'); customOpt.value = '__custom__'; customOpt.textContent = isKnown ? 'Custom…' : sig.DataType; if (!isKnown) customOpt.selected = true; typeSelect.appendChild(customOpt);
                 const customInput = document.createElement('input'); customInput.placeholder = 'Full .NET type'; customInput.value = isKnown ? '' : sig.DataType; customInput.style.display = isKnown ? 'none' : '';
                 customInput.addEventListener('change', () => { if (customInput.value.trim()) sig.DataType = customInput.value.trim(); setSigStatus(''); });
@@ -476,6 +536,93 @@ class ExecutePanel {
             el.className = 'sig-status' + (kind ? ' ' + kind : '');
         }
 
+        // ── Copy response to clipboard ──
+        function copyResponse() {
+            const text = document.getElementById('response').textContent;
+            if (!text || text === '— No response yet —') return;
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = document.getElementById('copyBtn');
+                btn.textContent = '✓ Copied';
+                btn.classList.add('copied');
+                setTimeout(() => { btn.textContent = '⎘ Copy'; btn.classList.remove('copied'); }, 1500);
+            });
+        }
+
+        // ── DataSet / tableset table renderer ──
+        function looksLikeDataSet(obj) {
+            if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+            // Check at any depth for an array-of-objects
+            function hasTableAnywhere(o, depth) {
+                if (depth > 5) return false;
+                for (const v of Object.values(o)) {
+                    if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') return true;
+                    if (v && typeof v === 'object' && !Array.isArray(v) && hasTableAnywhere(v, depth + 1)) return true;
+                }
+                return false;
+            }
+            return hasTableAnywhere(obj, 0);
+        }
+
+        // Recursively find all array-of-objects, using dot-path keys (e.g. "ds.Parts")
+        function extractTables(obj, prefix, depth) {
+            if (depth === undefined) depth = 0;
+            if (prefix === undefined) prefix = '';
+            if (depth > 5) return {};
+            const tables = {};
+            for (const [k, v] of Object.entries(obj)) {
+                const key = prefix ? prefix + '.' + k : k;
+                if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+                    tables[key] = v;
+                } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+                    Object.assign(tables, extractTables(v, key, depth + 1));
+                }
+            }
+            return tables;
+        }
+
+        let activeDatasetTab = null;
+        function renderDatasetTables(obj) {
+            const wrap = document.getElementById('datasetWrap');
+            const tables = extractTables(obj);
+            const keys = Object.keys(tables);
+            if (keys.length === 0) { wrap.style.display = 'none'; return; }
+            wrap.style.display = '';
+            activeDatasetTab = activeDatasetTab && tables[activeDatasetTab] ? activeDatasetTab : keys[0];
+
+            const tabHtml = keys.map(k =>
+                \`<button class="dataset-tab\${k === activeDatasetTab ? ' active' : ''}" onclick="switchDatasetTab('\${k}')">\${k} <span style="opacity:.55;font-weight:400;">(\${tables[k].length})</span></button>\`
+            ).join('');
+
+            const rows = tables[activeDatasetTab];
+            const cols = rows.length > 0 ? Object.keys(rows[0]) : [];
+            const colHeaders = cols.map(c => \`<th>\${c}</th>\`).join('');
+            const bodyRows = rows.map(r =>
+                \`<tr>\${cols.map(c => {
+                    const val = r[c];
+                    const display = val === null || val === undefined ? '<span style="opacity:.4">null</span>'
+                        : typeof val === 'object' ? JSON.stringify(val)
+                        : String(val);
+                    return \`<td title="\${String(val ?? '').replace(/"/g,'&quot;')}">\${display}</td>\`;
+                }).join('')}</tr>\`
+            ).join('');
+
+            wrap.innerHTML = \`
+                <div class="dataset-tabs">\${tabHtml}</div>
+                <div class="dataset-table-container">
+                    \${cols.length > 0
+                        ? \`<table class="dataset-table"><thead><tr>\${colHeaders}</tr></thead><tbody>\${bodyRows}</tbody></table>\`
+                        : '<div class="dataset-empty">No rows</div>'}
+                </div>\`;
+        }
+
+        function switchDatasetTab(key) {
+            activeDatasetTab = key;
+            try {
+                const obj = JSON.parse(document.getElementById('response').textContent);
+                renderDatasetTables(obj);
+            } catch(e) {}
+        }
+
         function doExecute() {
             const textarea = document.getElementById('payload');
             let payload;
@@ -496,18 +643,36 @@ class ExecutePanel {
             const btn = document.getElementById('executeBtn');
             const spinner = document.getElementById('spinner');
             const response = document.getElementById('response');
+            const datasetWrap = document.getElementById('datasetWrap');
 
             if (msg.command === 'executing') {
                 btn.disabled = true;
                 spinner.className = 'spinner active';
                 response.textContent = '⏳ Executing...';
                 response.className = '';
+                datasetWrap.style.display = 'none';
             }
             if (msg.command === 'result') {
                 btn.disabled = false;
                 spinner.className = 'spinner';
                 response.textContent = msg.data;
                 response.className = msg.success ? 'success' : 'error';
+                // Try to parse and render as DataSet table
+                if (msg.success) {
+                    try {
+                        const parsed = JSON.parse(msg.data);
+                        activeDatasetTab = null;
+                        if (looksLikeDataSet(parsedx)) {
+                            renderDatasetTables(parsed);
+                        } else {
+                            datasetWrap.style.display = 'none';
+                        }
+                    } catch(e) {
+                        datasetWrap.style.display = 'none';
+                    }
+                } else {
+                    datasetWrap.style.display = 'none';
+                }
             }
             if (msg.command === 'sigSaving') {
                 setSigStatus('Saving to Epicor…', 'saving');
