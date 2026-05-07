@@ -44,6 +44,7 @@ const executePanel_1 = require("./executePanel");
 const bpmClient_1 = require("./bpmClient");
 const bpmTreeProvider_1 = require("./bpmTreeProvider");
 const updater_1 = require("./updater");
+const kineticLayerClient_1 = require("./kineticLayerClient");
 // Store pulled tablesets for push-back/debugging.
 const pulledTablesets = new Map();
 // Map open .cs files back to their library/function.
@@ -346,12 +347,6 @@ function activate(context) {
                 const doc = await vscode.workspace.openTextDocument(filePath);
                 await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
                 vscode.window.showInformationMessage(`EFx: Pulled ${libraryId}.${functionId}`);
-
-                // Kick off initial validation
-                const mapping = fileMap.get(normalizeFsPath(filePath));
-                if (mapping && client) {
-                    scheduleEfxValidation(filePath, mapping, code);
-                }
             }
             catch (err) {
                 vscode.window.showErrorMessage(`EFx Pull failed: ${err.message}`);
@@ -1367,11 +1362,10 @@ function activate(context) {
             scheduleBpmValidation(filePath, mapping, e.document.getText());
         }
         if (mapping && !mapping.isBpm && client) {
-            scheduleEfxValidation(filePath, mapping, e.document.getText());
+            // EFx: scheduleEfxValidation manages its own state machine — no text passed here.
+            // It always reads fresh document text at fire time so DIRTY re-runs get current code.
+            scheduleEfxValidation(filePath, mapping);
         }
-        //ApplyChangesWithDiagnostics with RowMod:"" causes:
-        // "Can't infer library ID from the input"
-        // Use efx.regenerateLibrary instead.
     }));
 
     // ── Auto-push on save (if enabled in profile) ──
@@ -1385,37 +1379,72 @@ function activate(context) {
         await vscode.commands.executeCommand('efx.pushFunction', null, true);
     }));
 
-    // Clear diagnostics when BPM file is closed
+    // Clear diagnostics and validation state when a file is closed
     context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc => {
-        const mapping = fileMap.get(normalizeFsPath(doc.uri.fsPath));
+        const filePath = doc.uri.fsPath;
+        const mapping = fileMap.get(normalizeFsPath(filePath));
         if (mapping && mapping.isBpm) {
             bpmDiagnostics.delete(doc.uri);
         }
         if (mapping && !mapping.isBpm) {
             efxDiagnostics.delete(doc.uri);
+            // Cancel pending debounce and drop state so any in-flight run doesn't re-queue
+            const state = efxValidationState.get(filePath);
+            if (state?.timer) clearTimeout(state.timer);
+            efxValidationState.delete(filePath);
         }
     }));
 
-    // ── EFx debounced validation ──
-    // NOTE: Since Epicor has no stateless validate endpoint for EFx, validation IS a save.
-    // The no-change guard below prevents unnecessary saves while typing.
-    // If button-based validation is needed in future, extract the inner logic to a
-    // runEfxValidation(filePath, mapping, code) helper and call it directly.
-    const efxValidateTimers = new Map();
+    // ── EFx validation state machine ──
+    // Per-file states:
+    //   'idle'    — no validation running, debounce timer may be pending
+    //   'running' — validation in-flight, no new edits since it started
+    //   'dirty'   — validation in-flight AND new edits arrived during the run
+    //
+    // At most ONE session is ever open per file. Edits that arrive while a session is
+    // open collapse into a single 'dirty' flag and trigger exactly one re-run on completion.
+    const efxValidationState = new Map();
+    // filePath → { status: 'idle'|'running'|'dirty', timer: TimeoutHandle|null }
 
-    function scheduleEfxValidation(filePath, mapping, documentText) {
-        if (efxValidateTimers.has(filePath)) {
-            clearTimeout(efxValidateTimers.get(filePath));
+    function getEfxState(filePath) {
+        if (!efxValidationState.has(filePath)) {
+            efxValidationState.set(filePath, { status: 'idle', timer: null });
         }
-        efxValidateTimers.set(filePath, setTimeout(async () => {
-            efxValidateTimers.delete(filePath);
+        return efxValidationState.get(filePath);
+    }
+
+    function scheduleEfxValidation(filePath, mapping) {
+        const state = getEfxState(filePath);
+
+        if (state.status === 'running' || state.status === 'dirty') {
+            // Validation already in-flight — collapse all edits into a dirty flag.
+            if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+            state.status = 'dirty';
+            return;
+        }
+
+        // idle — reset the debounce timer
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = setTimeout(() => {
+            state.timer = null;
+            state.status = 'running';
+            runEfxValidation(filePath, mapping);
+        }, 1500);
+    }
+
+    async function runEfxValidation(filePath, mapping) {
+        const state = efxValidationState.get(filePath);
+        if (!state) return; // file was closed while queued
+
+        try {
             if (!client || !mapping.libraryId || !mapping.functionId) return;
 
-            try {
-                let code = documentText !== undefined
-                    ? documentText
-                    : fs.readFileSync(filePath, 'utf-8');
-                code = stripGeneratedHeader(code);
+            // Always read current document text — critical for DIRTY re-runs
+            const openDoc = vscode.workspace.textDocuments.find(
+                d => normalizeFsPath(d.uri.fsPath) === normalizeFsPath(filePath)
+            );
+            let code = openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf-8');
+            code = stripGeneratedHeader(code);
 
                 // ── No-change guard: skip network call if code matches cache ──
                 const cachedTableset = pulledTablesets.get(mapping.libraryId);
@@ -1459,9 +1488,7 @@ function activate(context) {
 
                 if (!diagnostics || diagnostics.length === 0) {
                     efxDiagnostics.set(uri, []);
-                    return;
-                }
-
+                } else {
                 const vsDiags = diagnostics.map(d => {
                     // Structured object — what ApplyChangesWithDiagnostics actually returns
                     if (typeof d === 'object' && d !== null) {
@@ -1504,11 +1531,22 @@ function activate(context) {
                 });
 
                 efxDiagnostics.set(uri, vsDiags);
-
-            } catch (_) {
-                // Non-fatal — swallow network/parse errors silently
             }
-        }, 1500)); // 1.5s debounce — longer than BPM since every fire is a real save + getLibraryRaw
+
+        } catch (_) {
+            // Non-fatal — swallow network/parse errors silently
+        } finally {
+            // ── State machine transition ──
+            const currentState = efxValidationState.get(filePath);
+            if (!currentState) return; // file was closed mid-run
+            const wasDirty = currentState.status === 'dirty';
+            currentState.status = 'idle';
+            if (wasDirty) {
+                // Edits arrived while we were running — re-run exactly once with current code
+                currentState.status = 'running';
+                runEfxValidation(filePath, mapping);
+            }
+        }
     }
     context.subscriptions.push(vscode.commands.registerCommand("efx.bpm.refresh", async () => {
         if (!bpmClientInst) {
@@ -1702,6 +1740,250 @@ function activate(context) {
                 }
             }
         );
+    }));
+    // ── Kinetic Tools sidebar view (empty tree — shows viewsWelcome buttons) ──
+    const kineticToolsView = vscode.window.createTreeView("kineticTools", {
+        treeDataProvider: {
+            onDidChangeTreeData: new vscode.EventEmitter().event,
+            getTreeItem: (el) => el,
+            getChildren: () => [],
+        },
+    });
+    context.subscriptions.push(kineticToolsView);
+
+    // ── Shared helper: prompt for profile + company, return a KineticMetaFXClient ──
+    async function pickKineticEnv(placeHolder) {
+        const profiles = getProfiles();
+        if (profiles.length < 1) {
+            vscode.window.showWarningMessage("EFx: No profiles configured. Add profiles via Manage Profiles first.");
+            return null;
+        }
+        const pick = await vscode.window.showQuickPick(
+            profiles.map(p => ({ label: p.name, description: p.serverUrl, profile: p })),
+            { placeHolder, ignoreFocusOut: true }
+        );
+        if (!pick) return null;
+
+        let company;
+        if (pick.profile.companies.length === 1) {
+            company = pick.profile.companies[0];
+        } else {
+            company = await vscode.window.showQuickPick(
+                pick.profile.companies,
+                { placeHolder: `Company on ${pick.profile.name}`, ignoreFocusOut: true }
+            );
+        }
+        if (!company) return null;
+
+        const pwd = await context.secrets.get(profileSecretKey(pick.profile.name, "password"));
+        if (!pwd) {
+            vscode.window.showErrorMessage(`EFx: No password stored for "${pick.profile.name}".`);
+            return null;
+        }
+        const apiKey = (await context.secrets.get(profileSecretKey(pick.profile.name, "apiKey"))) || "";
+        return new kineticLayerClient_1.KineticMetaFXClient({
+            serverUrl: pick.profile.serverUrl,
+            company,
+            username: pick.profile.username,
+            password: pwd,
+            apiKey,
+        });
+    }
+
+    // ── Transfer Full Kinetic App ──
+    // Flow: source env → app ID (or browse) → export → target env → import
+    context.subscriptions.push(vscode.commands.registerCommand("kinetic.transferApp", async () => {
+        const sourceClient = await pickKineticEnv("Source environment (download app from)");
+        if (!sourceClient) return;
+
+        // App ID — blank triggers a browse of all apps on source
+        const appIdRaw = await vscode.window.showInputBox({
+            prompt: "App ID to transfer. Leave blank to browse available apps.",
+            placeHolder: "Leave blank to see a list",
+            ignoreFocusOut: true,
+        });
+        if (appIdRaw === undefined) return;
+
+        let viewId = appIdRaw.trim();
+
+        if (!viewId) {
+            let allApps;
+            try {
+                allApps = await vscode.window.withProgress(
+                    { location: vscode.ProgressLocation.Notification, title: "Fetching app list…" },
+                    () => sourceClient.listApps()
+                );
+            } catch (err) {
+                vscode.window.showErrorMessage(`Kinetic: Failed to list apps: ${err.message}`);
+                return;
+            }
+            if (allApps.length === 0) {
+                vscode.window.showWarningMessage("Kinetic: No apps found on source.");
+                return;
+            }
+            const appPick = await vscode.window.showQuickPick(
+                allApps.map(a => ({
+                    label: a.Id,
+                    description: a.Type || "",
+                    detail: a.SubType || "",
+                    id: a.Id,
+                })),
+                { placeHolder: "Select app to transfer", ignoreFocusOut: true }
+            );
+            if (!appPick) return;
+            viewId = appPick.id;
+        }
+
+        // Export the full app from source (AppContent: { ViewId, CompanyId, Files })
+        let appContent;
+        try {
+            appContent = await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Exporting ${viewId}…` },
+                () => sourceClient.exportApp(viewId)
+            );
+        } catch (err) {
+            vscode.window.showErrorMessage(`Kinetic: Export failed: ${err.message}`);
+            return;
+        }
+        if (!appContent) {
+            vscode.window.showWarningMessage(`Kinetic: App "${viewId}" not found on source.`);
+            return;
+        }
+
+        const targetClient = await pickKineticEnv("Target environment (import app to)");
+        if (!targetClient) return;
+
+        // Check if app already exists on target
+        let exists = false;
+        try {
+            exists = await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Checking if "${viewId}" exists on target…` },
+                () => targetClient.applicationExists(viewId)
+            );
+        } catch { /* proceed and let later steps surface errors */ }
+
+        if (exists) {
+            const confirm = await vscode.window.showWarningMessage(
+                `App "${viewId}" already exists on the target. Overwrite it?`,
+                { modal: true },
+                "Overwrite"
+            );
+            if (confirm !== "Overwrite") return;
+        }
+
+        // Save as draft
+        try {
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Saving ${viewId} to target…` },
+                () => targetClient.saveApp(viewId, appContent.Files)
+            );
+        } catch (err) {
+            vscode.window.showErrorMessage(`Kinetic: Save failed: ${err.message}`);
+            return;
+        }
+
+        // Publish
+        try {
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Publishing ${viewId} on target…` },
+                () => targetClient.publishApp(viewId, appContent.Files)
+            );
+            vscode.window.showInformationMessage(`Kinetic: App "${viewId}" transferred successfully.`);
+        } catch (err) {
+            vscode.window.showErrorMessage(`Kinetic: Publish failed: ${err.message}`);
+        }
+    }));
+
+    // ── Transfer Kinetic Layers ──
+    // Flow: source env → app ID → select layers → export package → target env → import
+    context.subscriptions.push(vscode.commands.registerCommand("kinetic.transferLayers", async () => {
+        const sourceClient = await pickKineticEnv("Source environment (download layers from)");
+        if (!sourceClient) return;
+
+        const appIdRaw = await vscode.window.showInputBox({
+            prompt: "App ID whose layers you want to transfer",
+            placeHolder: "e.g. Erp.UI.SalesOrderEntry",
+            ignoreFocusOut: true,
+        });
+        if (appIdRaw == null || !appIdRaw.trim()) return;
+        const viewId = appIdRaw.trim();
+
+        const layerNamesInput = await vscode.window.showInputBox({
+            prompt: "Layer names to transfer (comma-separated). Leave blank to pick from a list.",
+            placeHolder: "e.g. Company-EPIC, Site-MAIN  — or leave blank to browse",
+            ignoreFocusOut: true,
+        });
+        if (layerNamesInput === undefined) return;
+        const requestedNames = layerNamesInput.split(",").map(s => s.trim()).filter(Boolean);
+
+        // Fetch layer descriptors for this specific app
+        let allLayers;
+        try {
+            allLayers = await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Fetching layers for ${viewId}…` },
+                () => sourceClient.getLayers(viewId)
+            );
+        } catch (err) {
+            vscode.window.showErrorMessage(`Kinetic: Failed to fetch layers: ${err.message}`);
+            return;
+        }
+
+        if (allLayers.length === 0) {
+            vscode.window.showWarningMessage(`Kinetic: No layers found for app "${viewId}" on source.`);
+            return;
+        }
+
+        let selectedLayers;
+        if (requestedNames.length > 0) {
+            selectedLayers = allLayers.filter(l => requestedNames.includes(l.LayerName));
+            const missing = requestedNames.filter(n => !allLayers.find(l => l.LayerName === n));
+            if (missing.length > 0) {
+                vscode.window.showWarningMessage(`Kinetic: Layer(s) not found on source: ${missing.join(", ")}`);
+            }
+            if (selectedLayers.length === 0) return;
+        } else {
+            const picks = await vscode.window.showQuickPick(
+                allLayers.map(l => ({
+                    label: l.LayerName || l.Id || "(unnamed)",
+                    description: l.TypeCode || "",
+                    detail: `Device: ${l.DeviceType || ""}  Published: ${l.IsPublished ? "Yes" : "No"}`,
+                    layer: l,
+                    picked: true,
+                })),
+                { canPickMany: true, placeHolder: "Select layers to transfer", ignoreFocusOut: true }
+            );
+            if (!picks || picks.length === 0) return;
+            selectedLayers = picks.map(p => p.layer);
+        }
+
+        // Export the selected layers as a package string from source
+        let exportedContent;
+        try {
+            exportedContent = await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Exporting ${selectedLayers.length} layer(s)…` },
+                () => sourceClient.exportLayers(selectedLayers)
+            );
+        } catch (err) {
+            vscode.window.showErrorMessage(`Kinetic: Export failed: ${err.message}`);
+            return;
+        }
+        if (exportedContent == null) {
+            vscode.window.showWarningMessage("Kinetic: Export returned empty — nothing to import.");
+            return;
+        }
+
+        const targetClient = await pickKineticEnv("Target environment (import layers to)");
+        if (!targetClient) return;
+
+        try {
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Importing ${selectedLayers.length} layer(s) to target…` },
+                () => targetClient.importLayers(exportedContent, true)
+            );
+            vscode.window.showInformationMessage(`Kinetic: ${selectedLayers.length} layer(s) imported successfully.`);
+        } catch (err) {
+            vscode.window.showErrorMessage(`Kinetic: Import failed: ${err.message}`);
+        }
     }));
 }
 // ─────────────────────────────────────────────────────────────────────────────
