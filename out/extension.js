@@ -1310,29 +1310,47 @@ function activate(context) {
     const efxDiagnostics = vscode.languages.createDiagnosticCollection('epicor-efx');
     context.subscriptions.push(efxDiagnostics);
 
-    // Debounce map: filePath -> timeout handle
-    const validateTimers = new Map();
+    // ── BPM validation state machine ──
+    // Same idle/running/dirty pattern as EFx — at most one validation session per file.
+    const bpmValidationState = new Map();
 
-    function scheduleBpmValidation(filePath, mapping, documentText) {
-        if (validateTimers.has(filePath)) {
-            clearTimeout(validateTimers.get(filePath));
+    function getBpmState(filePath) {
+        if (!bpmValidationState.has(filePath)) {
+            bpmValidationState.set(filePath, { status: 'idle', timer: null });
         }
-        validateTimers.set(filePath, setTimeout(async () => {
-            validateTimers.delete(filePath);
+        return bpmValidationState.get(filePath);
+    }
+
+    function scheduleBpmValidation(filePath, mapping) {
+        const state = getBpmState(filePath);
+        if (state.status === 'running' || state.status === 'dirty') {
+            if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+            state.status = 'dirty';
+            return;
+        }
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = setTimeout(() => {
+            state.timer = null;
+            state.status = 'running';
+            runBpmValidation(filePath, mapping);
+        }, 500);
+    }
+
+    async function runBpmValidation(filePath, mapping) {
+        const state = bpmValidationState.get(filePath);
+        if (!state) return;
+        try {
             if (!bpmClientInst || !mapping.isBpm || !mapping.functionDefinition) return;
-            try {
-                // Use passed-in document text if available (live buffer),
-                // otherwise fall back to disk (e.g. on initial pull)
-                let code = documentText !== undefined
-                    ? documentText
-                    : fs.readFileSync(filePath, 'utf-8');
-                code = stripGeneratedHeader(code);
-                const diagnostics = await bpmClientInst.validateCustomCode(code, mapping.functionDefinition);
-                const uri = vscode.Uri.file(filePath);
-                if (!diagnostics || diagnostics.length === 0) {
-                    bpmDiagnostics.set(uri, []);
-                    return;
-                }
+            const openDoc = vscode.workspace.textDocuments.find(
+                d => normalizeFsPath(d.uri.fsPath) === normalizeFsPath(filePath)
+            );
+            let code = openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf-8');
+            code = stripGeneratedHeader(code);
+            const diagnostics = await bpmClientInst.validateCustomCode(code, mapping.functionDefinition);
+            const uri = vscode.Uri.file(filePath);
+            if (!diagnostics || diagnostics.length === 0) {
+                bpmDiagnostics.set(uri, []);
+            } else {
                 const vsDiags = diagnostics.map(d => {
                     const startLine = Math.max(0, (d.Span?.start?.line ?? 1) - 1);
                     const startCol = Math.max(0, d.Span?.start?.column ?? 0);
@@ -1348,10 +1366,19 @@ function activate(context) {
                     return new vscode.Diagnostic(range, msg, severity);
                 });
                 bpmDiagnostics.set(uri, vsDiags);
-            } catch (_) {
-                // Validation errors are non-fatal — don't spam the user
             }
-        }, 500));
+        } catch (_) {
+            // Non-fatal
+        } finally {
+            const currentState = bpmValidationState.get(filePath);
+            if (!currentState) return;
+            const wasDirty = currentState.status === 'dirty';
+            currentState.status = 'idle';
+            if (wasDirty) {
+                currentState.status = 'running';
+                runBpmValidation(filePath, mapping);
+            }
+        }
     }
 
     // Watch open documents for BPM file changes
@@ -1359,7 +1386,7 @@ function activate(context) {
         const filePath = e.document.uri.fsPath;
         const mapping = fileMap.get(normalizeFsPath(filePath));
         if (mapping && mapping.isBpm && mapping.functionDefinition) {
-            scheduleBpmValidation(filePath, mapping, e.document.getText());
+            scheduleBpmValidation(filePath, mapping);
         }
         if (mapping && !mapping.isBpm && client) {
             // EFx: scheduleEfxValidation manages its own state machine — no text passed here.
@@ -1385,10 +1412,12 @@ function activate(context) {
         const mapping = fileMap.get(normalizeFsPath(filePath));
         if (mapping && mapping.isBpm) {
             bpmDiagnostics.delete(doc.uri);
+            const bpmState = bpmValidationState.get(filePath);
+            if (bpmState?.timer) clearTimeout(bpmState.timer);
+            bpmValidationState.delete(filePath);
         }
         if (mapping && !mapping.isBpm) {
             efxDiagnostics.delete(doc.uri);
-            // Cancel pending debounce and drop state so any in-flight run doesn't re-queue
             const state = efxValidationState.get(filePath);
             if (state?.timer) clearTimeout(state.timer);
             efxValidationState.delete(filePath);
@@ -1449,13 +1478,6 @@ function activate(context) {
                 // ── No-change guard: skip network call if code matches cache ──
                 const cachedTableset = pulledTablesets.get(mapping.libraryId);
                 const cachedFunc = cachedTableset?.EfxFunction?.find(f => f.FunctionID === mapping.functionId);
-                console.log('[EFx validate] firing for', mapping.functionId);
-                console.log('[EFx validate] cachedFunc found:', !!cachedFunc);
-                if (cachedFunc) {
-                    const cachedCode = epicorClient_1.EpicorClient.extractCode(cachedFunc.Body).code;
-                    console.log('[EFx validate] codes match:', normalizeCodeForCompare(cachedCode) === normalizeCodeForCompare(code));
-                }
-
                 if (cachedFunc) {
                     const cachedCode = epicorClient_1.EpicorClient.extractCode(cachedFunc.Body).code;
                     if (normalizeCodeForCompare(cachedCode) === normalizeCodeForCompare(code)) {
