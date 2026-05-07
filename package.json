@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.4.1",
+	"version": "0.4.2",
 	"publisher": "micah-bragg",
 	"engines": {
 		"vscode": "^1.85.0"
@@ -31,6 +31,10 @@
 				{
 					"id": "bpmMethods",
 					"name": "BPM Methods"
+				},
+				{
+					"id": "kineticTools",
+					"name": "Kinetic Transfer"
 				}
 			]
 		},
@@ -166,10 +170,38 @@
 				"title": "Check for Updates",
 				"icon": "$(cloud-download)",
 				"category": "EFx"
+			},
+			{
+				"command": "kinetic.transferApp",
+				"title": "Transfer Full App Between Environments",
+				"icon": "$(cloud-upload)",
+				"category": "Kinetic"
+			},
+			{
+				"command": "kinetic.transferLayers",
+				"title": "Transfer App Layers Between Environments",
+				"icon": "$(layers)",
+				"category": "Kinetic"
+			}
+		],
+		"viewsWelcome": [
+			{
+				"view": "kineticTools",
+				"contents": "Transfer Kinetic apps and customization layers between environments (dev → prod, pilot → prod, etc.).\n\n[$(cloud-upload) Transfer Full App](command:kinetic.transferApp)\n\n[$(layers) Transfer Layers](command:kinetic.transferLayers)"
 			}
 		],
 		"menus": {
 			"view/title": [
+				{
+					"command": "kinetic.transferApp",
+					"when": "view == kineticTools",
+					"group": "navigation@1"
+				},
+				{
+					"command": "kinetic.transferLayers",
+					"when": "view == kineticTools",
+					"group": "navigation@2"
+				},
 				{
 					"command": "efx.refreshLibraries",
 					"when": "view == efxLibraries",
