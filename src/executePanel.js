@@ -662,7 +662,7 @@ class ExecutePanel {
                     try {
                         const parsed = JSON.parse(msg.data);
                         activeDatasetTab = null;
-                        if (looksLikeDataSet(parsedx)) {
+                        if (looksLikeDataSet(parsed)) {
                             renderDatasetTables(parsed);
                         } else {
                             datasetWrap.style.display = 'none';

@@ -26,8 +26,9 @@ const os = __importStar(require("os"));
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIGURE THIS — set to your actual GitHub owner/repo
 // ─────────────────────────────────────────────────────────────────────────────
-const GITHUB_OWNER = 'micah-bragg';
-const GITHUB_REPO  = 'epicor-efx-manager';
+const GITHUB_OWNER     = 'mbcpi';
+const GITHUB_REPO      = 'epicor-customcode-manager';
+const EXTENSION_PUBLISHER = 'micah-bragg';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RELEASES_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
@@ -141,7 +142,7 @@ async function installRelease(release) {
 
 // ── Main check logic — used by both startup and manual command ──
 async function checkForUpdates(context, silent = false) {
-    const ext = vscode.extensions.getExtension(`${GITHUB_OWNER}.epicor-efx-manager`);
+    const ext = vscode.extensions.getExtension(`${EXTENSION_PUBLISHER}.epicor-efx-manager`);
     const localVersion = ext?.packageJSON?.version || '0.0.0';
 
     let release;
