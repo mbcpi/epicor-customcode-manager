@@ -382,13 +382,34 @@ class EpicorClient {
             EfxFunction: [funcRow],
         };
 
-        const result = await this.request(
-            this.getEfxUrl(wrapperLibrary, wrapperFn),
-            {
-                inFunctionID: functionId,
-                inDS,
+        let result;
+        try {
+            result = await this.request(
+                this.getEfxUrl(wrapperLibrary, wrapperFn),
+                { inFunctionID: functionId, inDS }
+            );
+        } catch (wrapperErr) {
+            // Wrapper function unavailable (library not promoted or doesn't exist).
+            // Fall back to the designer service ApplyChangesWithDiagnostics endpoint directly.
+            if (/HTTP 404/.test(wrapperErr.message)) {
+                try {
+                    await this.applyChanges(inDS);
+                    return {
+                        saved: true, diagnostics: [], errors: [],
+                        outResult: '', outMsg: 'Saved Successfully', raw: null,
+                        newBody: EpicorClient.packCode(code, usings || ''),
+                    };
+                } catch (directErr) {
+                    const msg = directErr.message || String(directErr);
+                    return {
+                        saved: false,
+                        diagnostics: [{ Severity: 2, Message: msg }],
+                        errors: [msg], outResult: '', outMsg: msg, raw: null, newBody: null,
+                    };
+                }
             }
-        );
+            throw wrapperErr;
+        }
 
         const outMsg = result?.outMsg ?? result?.parameters?.outMsg ?? '';
         const outResult = result?.outResult ?? result?.parameters?.outResult ?? '';

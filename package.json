@@ -2,8 +2,12 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.4.3",
+	"version": "0.6.0",
 	"publisher": "micah-bragg",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/mbcpi/epicor-customcode-manager.git"
+	},
 	"engines": {
 		"vscode": "^1.85.0"
 	},
@@ -31,10 +35,6 @@
 				{
 					"id": "bpmMethods",
 					"name": "BPM Methods"
-				},
-				{
-					"id": "kineticTools",
-					"name": "Kinetic Transfer"
 				}
 			]
 		},
@@ -130,6 +130,12 @@
 				"category": "EFx"
 			},
 			{
+				"command": "efx.setTableUpdatable",
+				"title": "Set Read-only / Updatable",
+				"icon": "$(edit)",
+				"category": "EFx"
+			},
+			{
 				"command": "efx.addService",
 				"title": "Add Service Reference",
 				"icon": "$(add)",
@@ -154,6 +160,12 @@
 				"category": "BPM"
 			},
 			{
+				"command": "efx.bpm.openWidgetPanel",
+				"title": "Open Widget Panel",
+				"icon": "$(circuit-board)",
+				"category": "BPM"
+			},
+			{
 				"command": "efx.bpm.pullDirective",
 				"title": "Pull Directive Code",
 				"icon": "$(cloud-download)",
@@ -172,36 +184,13 @@
 				"category": "EFx"
 			},
 			{
-				"command": "kinetic.transferApp",
-				"title": "Transfer Full App Between Environments",
-				"icon": "$(cloud-upload)",
-				"category": "Kinetic"
-			},
-			{
-				"command": "kinetic.transferLayers",
-				"title": "Transfer App Layers Between Environments",
-				"icon": "$(layers)",
-				"category": "Kinetic"
-			}
-		],
-		"viewsWelcome": [
-			{
-				"view": "kineticTools",
-				"contents": "Transfer Kinetic apps and customization layers between environments (dev → prod, pilot → prod, etc.).\n\n[$(cloud-upload) Transfer Full App](command:kinetic.transferApp)\n\n[$(layers) Transfer Layers](command:kinetic.transferLayers)"
+				"command": "efx.dev.dumpBpmXaml",
+				"title": "DEV: Dump BPM Widget XAML",
+				"category": "EFx"
 			}
 		],
 		"menus": {
 			"view/title": [
-				{
-					"command": "kinetic.transferApp",
-					"when": "view == kineticTools",
-					"group": "navigation@1"
-				},
-				{
-					"command": "kinetic.transferLayers",
-					"when": "view == kineticTools",
-					"group": "navigation@2"
-				},
 				{
 					"command": "efx.refreshLibraries",
 					"when": "view == efxLibraries",
@@ -285,6 +274,11 @@
 					"group": "inline@1"
 				},
 				{
+					"command": "efx.setTableUpdatable",
+					"when": "view == efxLibraries && viewItem == reference-item-tables",
+					"group": "inline@1"
+				},
+				{
 					"command": "efx.addService",
 					"when": "view == efxLibraries && viewItem == reference-group-services",
 					"group": "inline@1"
@@ -298,6 +292,16 @@
 					"command": "efx.addLibraryRef",
 					"when": "view == efxLibraries && viewItem == reference-group-libraries",
 					"group": "inline@1"
+				},
+				{
+					"command": "efx.bpm.openWidgetPanel",
+					"when": "view == bpmMethods && viewItem == bpm-directive-nocode",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.bpm.openWidgetPanel",
+					"when": "view == bpmMethods && viewItem == bpm-directive-code",
+					"group": "inline@3"
 				},
 				{
 					"command": "efx.bpm.pullDirective",
@@ -322,6 +326,10 @@
 				},
 				{
 					"command": "efx.deleteFunction",
+					"when": "false"
+				},
+				{
+					"command": "efx.setTableUpdatable",
 					"when": "false"
 				}
 			]
@@ -378,15 +386,20 @@
 		}
 	},
 	"scripts": {
-		"vscode:prepublish": "echo no build step",
-		"compile": "tsc -p ./",
-		"watch": "tsc -watch -p ./",
+		"vscode:prepublish": "npm run compile",
+		"compile": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs",
+		"deploy": "npm run compile && cp out/extension.js /Users/micahbragg-cpi/.antigravity/extensions/micah-bragg.epicor-efx-manager-0.5.0/out/extension.js",
+		"watch": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
 		"package": "npx @vscode/vsce package"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
 		"@types/vscode": "^1.85.0",
 		"@vscode/vsce": "^2.32.0",
+		"esbuild": "^0.28.0",
 		"typescript": "^5.3.0"
+	},
+	"dependencies": {
+		"@xmldom/xmldom": "^0.9.10"
 	}
 }

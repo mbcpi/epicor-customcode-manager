@@ -104,6 +104,14 @@ class BpmDirectiveNode extends vscode.TreeItem {
 
         this.contextValue = hasCustomCode ? 'bpm-directive-code' : 'bpm-directive-nocode';
 
+        if (!hasCustomCode) {
+            this.command = {
+                command: 'efx.bpm.openWidgetPanel',
+                title: 'Open Widget Panel',
+                arguments: [{ directive }],
+            };
+        }
+
         this.tooltip = [
             directive.Name,
             `Type: ${typeLabel}`,
