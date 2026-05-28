@@ -2,6 +2,8 @@
 
 A VS Code extension for working with Epicor Kinetic EFx Function Libraries and BPM Directives directly from your editor — pull, edit, push, execute, and manage signatures without leaving VS Code.
 
+![EFx Manager in action](screenshot.png)
+
 ---
 
 ## Features
@@ -23,7 +25,8 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 - **Promote / Demote** libraries to/from production
 - **Regenerate / Validate** libraries
 - **Manage references** — tables, services, assemblies, and library references
-  - Plus `+` button on the Functions group matches the UX of table/service/assembly groups
+  - Toggle any table reference between **Read-only** and **Updatable** with a right-click
+  - `+` button on the Functions group matches the UX of table/service/assembly groups
 
 ### BPM Directives
 
@@ -48,14 +51,14 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 Install the `.vsix` file directly in VS Code via **Extensions → ··· → Install from VSIX**, or run:
 
 ```
-code --install-extension epicor-efx-manager-0.3.0.vsix
+code --install-extension epicor-efx-manager-0.6.0.vsix
 ```
 
 ### 2. Install the Utilities Library in Epicor
 
 This extension relies on the **Utilities** EFx function library for saving code changes. You must install it in each Epicor environment you want to use the extension with.
 
-Download the `Utilities.efx` library package and import it via **Epicor → Function Library Maintenance → Import**. If you do not have the Utilities library, contact the publisher.
+Download the `Utilities.efxb` library package from the release assets and import it via **Epicor → Function Library Maintenance → Import**. If you do not have access to the release, contact the publisher.
 
 ### 3. Add Utilities to Your Access Scope
 
@@ -78,7 +81,7 @@ Any EFx library you want to pull from, push to, or execute must also be in your 
 
 ---
 
-
+## Getting Started
 
 ### 1. Configure a Profile
 
@@ -110,6 +113,10 @@ Click the **play icon** on a function node to open the Execute panel. Select a c
 
 In the Execute panel, click **⚙ Edit Signatures** to open the signature editor. Switch between the **Request Params** and **Response Params** tabs to add, edit, or remove parameters. Click **💾 Save to Epicor** to persist changes — this updates the actual function definition in Epicor, exactly as if you'd done it in Function Maintenance.
 
+### 7. Manage Table References
+
+Expand any library's **Tables** group to see its table references. Hover a table row to reveal the **✏️ edit icon** — click it to toggle between **Read-only** and **Updatable** without having to remove and re-add the table.
+
 ---
 
 ## Commands
@@ -129,6 +136,7 @@ In the Execute panel, click **⚙ Edit Signatures** to open the signature editor
 | `EFx: Promote to Production` | Promote a library to production |
 | `EFx: Demote from Production` | Demote a library from production |
 | `EFx: Regenerate / Validate Library` | Regenerate and validate a library |
+| `EFx: Set Read-only / Updatable` | Toggle a table reference's access mode (right-click a table in the tree) |
 | `BPM: Refresh BPM Methods` | Reload the BPM method tree |
 | `BPM: Pull Directive Code` | Pull a BPM directive's C# code |
 | `BPM: Push Directive Code` | Push edited BPM directive code back |
@@ -141,7 +149,7 @@ In the Execute panel, click **⚙ Edit Signatures** to open the signature editor
 - REST API access to your Epicor server
 - Your Epicor user must have access to `Ice.LIB.EfxLibraryDesignerSvc`
 - To use the push/save path via the `Utilities` wrapper library, your user needs EFx execute access to `Utilities.ApplyChangesWithDiagnostics` — if not, the extension falls back to the direct designer service endpoint automatically
-- the Utilities wrapper library MUST REMAIN PUBLISHED
+- The Utilities wrapper library **must remain published**
 
 ---
 
@@ -167,11 +175,22 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 
 ## Changelog
 
+### 0.6.0
+- **Set Read-only / Updatable** — right-click any table reference in the tree to toggle its access mode without removing and re-adding it
+- **Source restructure** — all source moved into `src/` with esbuild bundling; cleaner build and easier to contribute to
+- **BPM overhaul** — more reliable widget editing and parameter handling
+- **`repository` field** added to manifest — fixes vsce warning and makes the auto-updater's GitHub URL canonical
+
+### 0.5.0
+- **Auto-updater** — the extension checks GitHub releases on startup and prompts to update when a new version is available; install with one click, no manual VSIX download required
+- **BPM Widget panel** — open and edit BPM widget definitions directly from the directive tree
+- **Improved diagnostics** — compile errors from push/save surface more reliably across all Epicor versions
+
 ### 0.4.0
 - **Staging execute** — unpromoted libraries automatically execute via `/api/v2/efx/staging/...` instead of the production endpoint
 - **`+` button on Functions group** — add a new function directly from the Functions group header, consistent with table/service/assembly groups
 - **Auto-push on save** — new profile setting; when enabled, saving a `.cs` file immediately pushes it to Epicor without a confirmation dialog
-- **Params on function creation** — optionally add request and response parameters inline during `New Function`, no need to open Execute panel after
+- **Params on function creation** — optionally add request and response parameters inline during `New Function`
 - **Copy response button** — one-click copy of the raw response JSON in the Execute panel
 - **DataSet response parser** — if the response is a tableset/DataSet shape, a rendered table view is shown alongside the raw JSON
 - **`System.Data.DataSet` / `System.Data.DataTable` in type dropdown** — no longer requires the "Custom…" workaround
