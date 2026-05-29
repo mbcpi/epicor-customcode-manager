@@ -46,6 +46,7 @@ const bpmTreeProvider_1 = require("./bpmTreeProvider");
 const { openWidgetPanel } = require("./bpmWidgetPanel");
 const updater_1 = require("./updater");
 const kineticLayerClient_1 = require("./kineticLayerClient");
+const { ComparePanel } = require("./comparePanel");
 // Store pulled tablesets for push-back/debugging.
 const pulledTablesets = new Map();
 // Map open .cs files back to their library/function.
@@ -2087,6 +2088,9 @@ function activate(context) {
         } catch (err) {
             out.appendLine(`ERROR: ${err.message}`);
         }
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand("efx.compareLibraries", () => {
+        ComparePanel.show(context);
     }));
 }
 // ─────────────────────────────────────────────────────────────────────────────

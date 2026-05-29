@@ -99,34 +99,88 @@ class KineticMetaFXClient {
         });
     }
 
+    // GET request — used for endpoints like GetApp that take a 'request' query param
+    _get(method, params) {
+        return new Promise((resolve, reject) => {
+            const url = this._methodUrl(method);
+            const parsed = new URL(url);
+            parsed.searchParams.set('request', JSON.stringify(params));
+            const isHttps = parsed.protocol === "https:";
+            const mod = isHttps ? https : http;
+            const hdrs = this._getHeaders();
+            delete hdrs['Content-Type']; // no body on GET
+            const options = {
+                hostname: parsed.hostname,
+                port: parsed.port || (isHttps ? 443 : 80),
+                path: parsed.pathname + '?' + parsed.searchParams.toString(),
+                method: "GET",
+                headers: hdrs,
+                rejectUnauthorized: false,
+            };
+            const req = mod.request(options, (res) => {
+                let data = "";
+                res.on("data", chunk => { data += chunk; });
+                res.on("end", () => {
+                    if (res.statusCode >= 200 && res.statusCode < 300) {
+                        try { resolve(data ? JSON.parse(data) : null); }
+                        catch { resolve(data); }
+                    } else {
+                        let msg = `HTTP ${res.statusCode}`;
+                        try {
+                            const e = JSON.parse(data);
+                            msg = e.error?.message || e.ErrorMessage || data;
+                        } catch { msg = data || msg; }
+                        console.error(`[MetaFX] GET ${method} failed ${res.statusCode}:`, data.slice(0, 1000));
+                        reject(new Error(msg));
+                    }
+                });
+            });
+            req.on("error", reject);
+            req.end();
+        });
+    }
+
     // ── Apps ──────────────────────────────────────────────────────────────────
 
     // List all apps (lightweight — no layer detail). Each row has: Id, Type, SubType, LastUpdated, etc.
     async listApps() {
-        const result = await this._call("GetApplications", { request: {} });
+        const result = await this._call("GetApplications", {
+            request: { Type: "view", SubType: "", SearchText: "", IncludeAllLayers: true },
+        });
         return Array.isArray(result?.returnObj) ? result.returnObj : [];
     }
 
     // Get layer descriptors for a specific app (used to build the ExportLayers payload).
-    // Uses GetLayers rather than GetApplications({IncludeAllLayers:true}) which causes a 500.
+    // Uses GetLayers — GetApp returns merged app content, not a layer list.
     async getLayers(viewId) {
         const result = await this._call("GetLayers", {
             request: { ViewId: viewId, IncludeUnpublishedLayers: true },
         });
-        // returnObj shape is undocumented — handle the common variants
         const obj = result?.returnObj;
         if (Array.isArray(obj)) return obj;
-        if (Array.isArray(obj?.Layers)) return obj.Layers;
-        if (Array.isArray(obj?.layers)) return obj.layers;
-        if (Array.isArray(obj?.value)) return obj.value;
-        // Log the actual shape so we can adapt if none of the above matched
-        if (obj != null) console.error("[MetaFX] GetLayers returnObj shape:", JSON.stringify(obj).slice(0, 500));
+        if (obj && typeof obj === 'object') {
+            const KNOWN_KEYS = ['Layers', 'layers', 'EpMetaFXLayerForApplicationList', 'LayerList',
+                                'value', 'Value', 'data', 'Data', 'items', 'Items', 'Result', 'result',
+                                'EpMetaFXLayerList', 'AppLayerList', 'LayerDescriptors'];
+            for (const k of KNOWN_KEYS) {
+                if (Array.isArray(obj[k])) return obj[k];
+            }
+            // Last resort: first array-valued property
+            for (const [k, v] of Object.entries(obj)) {
+                if (Array.isArray(v)) {
+                    console.error("[MetaFX] GetLayers used fallback key:", k, "shape keys:", Object.keys(obj));
+                    return v;
+                }
+            }
+        }
+        if (obj != null) console.error("[MetaFX] GetLayers returnObj (no array found):", JSON.stringify(obj).slice(0, 600));
+        else console.error("[MetaFX] GetLayers result:", JSON.stringify(result).slice(0, 600));
         return [];
     }
 
     // Check if an app already exists on this server.
     async applicationExists(viewId) {
-        const result = await this._call("ApplicationExists", { applicationFullName: viewId });
+        const result = await this._call("ApplicationExists", { viewId });
         return result?.returnObj === true;
     }
 
@@ -139,6 +193,42 @@ class KineticMetaFXClient {
     async exportApp(viewId) {
         const result = await this._call("ExportApp", { viewId });
         return result?.returnObj || null;
+    }
+
+    // Fetch the merged app content for a specific layer via GetApp (GET).
+    // layerDescription is the LayerDescription string from GetLayers (e.g. "V5_2594_20260529_MB").
+    // Returns returnObj: { Layout, Events, DataViews, Rules, ToolBar, Pages, Properties, ... }
+    async getAppForLayer(viewId, layerDescription) {
+        console.log(`[MetaFX] getAppForLayer → viewId="${viewId}" layer="${layerDescription}"`);
+        const request = {
+            id: viewId,
+            properties: {
+                deviceType: "Desktop",
+                layers: [layerDescription],
+                baseAppVersion: 0,
+                layerVersion: 0,
+                mode: "AppStudio",
+                applicationType: "view",
+                ignorePersonalization: false,
+                additionalContext: { doValidation: true, menuId: "preview", inPreviewMode: true },
+                checkDuplicateIds: false,
+                debug: false,
+            },
+        };
+        console.log(`[MetaFX] getAppForLayer request:`, JSON.stringify(request));
+        try {
+            const result = await this._get("GetApp", request);
+            const obj = result?.returnObj;
+            if (!obj) {
+                console.error(`[MetaFX] getAppForLayer: empty returnObj. Full response:`, JSON.stringify(result).slice(0, 500));
+                return null;
+            }
+            console.log(`[MetaFX] getAppForLayer OK — top-level keys:`, Object.keys(obj));
+            return obj;
+        } catch (e) {
+            console.error(`[MetaFX] getAppForLayer failed for layer="${layerDescription}":`, e.message);
+            throw e;
+        }
     }
 
     // Find a specific app's metadata (Type, SubType) from the app list on this server.
@@ -154,20 +244,74 @@ class KineticMetaFXClient {
         });
     }
 
-    // Save app content as a draft. files = Files dict from exportApp().
-    async saveApp(viewId, files) {
+    // Build a layerInfo object for SaveApp / PublishApp.
+    // meta: { subType, typeCode, isNew, company, layerDescription, comment, wip }
+    _buildLayerInfo(viewId, meta = {}, wip = true) {
+        const desc = meta.layerDescription || '';
+        return {
+            ViewId: viewId,
+            LayerDescription: desc,
+            LayerName: desc,
+            TypeCode: meta.typeCode || 'KNTCCustLayer',
+            WIP: wip,
+            IsNew: meta.isNew || false,
+            Company: meta.company || this.config.company || '',
+            DeviceType: 'Desktop',
+            CGCCode: '',
+            SystemFlag: false,
+            HasDraftContent: wip,
+            PublishParentLayers: false,
+            CommentText: meta.comment || '',
+            ParentLayers: null,
+            UserName: null,
+            Content: null,
+            ChangedOn: new Date().toISOString().slice(0, 10) + 'T00:00:00',
+            LayerUpdatedToPropDiffFormat: null,
+            ProcessedInfo: null,
+            LastUpdatedBy: '',
+        };
+    }
+
+    // Save app content as a draft (WIP). files = Files dict from exportApp().
+    // meta: { subType, typeCode, isNew, company, layerDescription, comment }
+    async saveApp(viewId, files, meta = {}) {
         const parsed = parseAppFiles(files);
-        await this._call("SaveApp", {
-            request: { id: viewId, ...parsed },
+        const subType = meta.subType || parsed.layout?.viewType || 'Dashboard';
+        const result = await this._call("SaveApp", {
+            request: {
+                id: viewId,
+                viewType: subType,
+                ...parsed,
+                applicationType: 'view',
+                subApplicationType: subType,
+                uxAppVersion: 0,
+                commentText: meta.comment || '',
+                deviceType: 'Desktop',
+                layerInfo: this._buildLayerInfo(viewId, meta, true),
+            },
         });
+        return result?.returnObj;
     }
 
     // Publish the saved draft — makes the app live.
-    async publishApp(viewId, files) {
+    // meta: same shape as saveApp.
+    async publishApp(viewId, files, meta = {}) {
         const parsed = parseAppFiles(files);
-        await this._call("PublishApp", {
-            request: { id: viewId, ...parsed },
+        const subType = meta.subType || parsed.layout?.viewType || 'Dashboard';
+        const result = await this._call("PublishApp", {
+            request: {
+                id: viewId,
+                viewType: subType,
+                ...parsed,
+                applicationType: 'view',
+                subApplicationType: subType,
+                uxAppVersion: 0,
+                commentText: meta.comment || '',
+                deviceType: 'Desktop',
+                layerInfo: this._buildLayerInfo(viewId, meta, false),
+            },
         });
+        return result?.returnObj;
     }
 
     // ── Layers ────────────────────────────────────────────────────────────────

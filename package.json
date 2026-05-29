@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.6.0",
+	"version": "0.6.5",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -187,6 +187,12 @@
 				"command": "efx.dev.dumpBpmXaml",
 				"title": "DEV: Dump BPM Widget XAML",
 				"category": "EFx"
+			},
+			{
+				"command": "efx.compareLibraries",
+				"title": "Compare Libraries",
+				"icon": "$(diff)",
+				"category": "EFx"
 			}
 		],
 		"menus": {
@@ -213,6 +219,11 @@
 				},
 				{
 					"command": "efx.newLibrary",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.compareLibraries",
 					"when": "view == efxLibraries",
 					"group": "navigation"
 				},
