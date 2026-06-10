@@ -332,9 +332,17 @@ class EpicorClient {
         code,
         usings,
         wrapperLibrary = 'Utilities',
-        wrapperFn = 'ApplyChangesWithDiagnostics'
+        wrapperFn = 'ApplyChangesWithDiagnostics',
+        cachedTableset = null
     ) {
-        const tableset = await this.getLibrary(libraryId);
+        // The wrapper re-fetches the live tableset server-side before applying
+        // changes, so a caller-provided cached tableset is safe here — it only
+        // supplies row metadata. This lets the validation debounce skip
+        // downloading the entire library on every typing pause.
+        let tableset = cachedTableset;
+        if (!tableset?.EfxLibrary?.[0] || !tableset.EfxFunction?.some(f => f.FunctionID === functionId)) {
+            tableset = await this.getLibrary(libraryId);
+        }
 
         if (!tableset?.EfxLibrary?.[0]) {
             const message = `Library '${libraryId}' not found`;
@@ -390,14 +398,19 @@ class EpicorClient {
             );
         } catch (wrapperErr) {
             // Wrapper function unavailable (library not promoted or doesn't exist).
-            // Fall back to the designer service ApplyChangesWithDiagnostics endpoint directly.
+            // Fall back to raw designer-service save — uses getLibraryRaw to preserve
+            // int64 SysRevID values exactly, avoiding optimistic locking failures.
             if (/HTTP 404/.test(wrapperErr.message)) {
                 try {
-                    await this.applyChanges(inDS);
+                    const rawResult = await this.validateFunctionRaw(libraryId, functionId, code, usings);
                     return {
-                        saved: true, diagnostics: [], errors: [],
-                        outResult: '', outMsg: 'Saved Successfully', raw: null,
-                        newBody: EpicorClient.packCode(code, usings || ''),
+                        saved: rawResult.saved,
+                        diagnostics: rawResult.diagnostics || [],
+                        errors: rawResult.saved ? [] : (rawResult.diagnostics?.map(d => d.Message || String(d)) || ['Save failed']),
+                        outResult: rawResult.saved ? 'Success' : '',
+                        outMsg: rawResult.saved ? 'Saved Successfully' : 'Save failed',
+                        raw: null,
+                        newBody: rawResult.saved ? rawResult.newBody : null,
                     };
                 } catch (directErr) {
                     const msg = directErr.message || String(directErr);
@@ -416,20 +429,74 @@ class EpicorClient {
         const outSuccess = result?.outSuccess ?? result?.parameters?.outSuccess ?? false;
 
         const errors = [];
+        const seen = new Set();
+        const addError = (text) => { const t = text.trim(); if (t && !seen.has(t)) { seen.add(t); errors.push(t); } };
         for (const line of String(outMsg).split(/\r?\n/)) {
             const m = line.match(/^Error:\s*(.+)$/i);
-            if (m) errors.push(m[1].trim());
+            if (m) { addError(m[1]); continue; }
+            // Compiler lines that arrive WITHOUT the wrapper's "Error:" prefix,
+            // e.g. "CopyFromTemp.cs(27,1): error CS0246: ..." — previously these
+            // were dropped entirely, so some diagnostics never registered.
+            if (/\(\d+,\d+\):\s*(?:error|warning)\s+CS/i.test(line)) addError(line);
         }
 
+        // Warnings are surfaced as diagnostics but must not flip a successful
+        // save to "failed" — only error-severity lines count against saved.
+        const fatalErrors = errors.filter(e => !/\(\d+,\d+\):\s*warning\s+CS/i.test(e));
         const saved = outSuccess === true || (
-            errors.length === 0 &&
+            fatalErrors.length === 0 &&
             /Saved Successfully/i.test(outMsg)
         );
 
-        const diagnostics = errors.map(message => ({
-            Severity: 2,
-            Message: message,
-        }));
+        const diagnostics = errors.map(message => {
+            // Recover the source position from the wrapper's flattened compiler
+            // text. Real shape: "CopyFromTemp.cs(27,1): error CS0246: The type..."
+            // Prefer the Roslyn "(line,col): error|warning" form so a stray
+            // parenthesized number elsewhere in the message can't win; fall back
+            // to any "(line,col)" pair, then "line N" prose. Without this every
+            // diagnostic lands on line 0 in the editor.
+            const pos = message.match(/\((\d+),(\d+)\):\s*(?:error|warning)/i)
+                || message.match(/\((\d+),(\d+)\)/)
+                || message.match(/\bline\s+(\d+)/i);
+            return {
+                Severity: /\(\d+,\d+\):\s*warning\s+CS/i.test(message) ? 1 : 2,
+                Message: message,
+                Line: pos ? parseInt(pos[1], 10) : undefined,
+                Column: pos && pos[2] !== undefined ? parseInt(pos[2], 10) : undefined,
+            };
+        });
+
+        // ── Server-line calibration ──
+        // Epicor compiles the function wrapped in a generated preamble (usings +
+        // class/method wrapper), so reported line numbers are shifted by an
+        // unknown, build-dependent amount (observed: +25). Calibrate by locating
+        // the quoted tokens from the error messages (e.g. name 'Db') in the code
+        // we actually sent, at the reported column, and taking the consensus shift.
+        const codeLines = String(code).split(/\r?\n/);
+        const offsetVotes = new Map();
+        for (const d of diagnostics) {
+            if (!d.Line || !d.Column) continue;
+            const tok = d.Message.match(/'([^']+)'/);
+            // Only identifier-like tokens — punctuation tokens like ',' would
+            // match almost anywhere and pollute the vote.
+            if (!tok || !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(tok[1])) continue;
+            for (let i = 0; i < codeLines.length; i++) {
+                if (codeLines[i].slice(d.Column - 1).startsWith(tok[1])) {
+                    const shift = d.Line - (i + 1);
+                    if (shift >= 0) offsetVotes.set(shift, (offsetVotes.get(shift) || 0) + 1);
+                }
+            }
+        }
+        let serverShift = 0, bestVotes = 0, tied = false;
+        for (const [shift, votes] of offsetVotes) {
+            if (votes > bestVotes) { bestVotes = votes; serverShift = shift; tied = false; }
+            else if (votes === bestVotes && shift !== serverShift) { tied = true; }
+        }
+        if (bestVotes > 0 && !tied && serverShift > 0) {
+            for (const d of diagnostics) {
+                if (d.Line) d.Line = Math.max(1, d.Line - serverShift);
+            }
+        }
 
         return {
             saved,

@@ -1,7 +1,8 @@
 "use strict";
 const vscode = require("vscode");
 const { EpicorClient } = require("./epicorClient");
-const { BpmClient, extractBpmCode } = require("./bpmClient");
+const { BpmClient, extractBpmCode, formatBpmBodyXaml } = require("./bpmClient");
+const { directiveToCanonicalText } = require("./bpmXaml");
 const { KineticMetaFXClient } = require("./kineticLayerClient");
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -147,6 +148,12 @@ function compareDirective(da, db) {
     const cA = da._code || '', cB = db._code || '', codeSame = cA === cB;
     if (!codeSame) hasDiff = true;
     fields.Code = { a: cA, b: cB, same: codeSame };
+    // Full widget/XAML comparison — directives can differ in widgets while the
+    // (first) custom-code block matches, or have no code at all. Bodies are
+    // only shipped to the webview when they actually differ.
+    const xA = da._bodyNorm || '', xB = db._bodyNorm || '', xamlSame = xA === xB;
+    if (!xamlSame) hasDiff = true;
+    fields.Xaml = xamlSame ? { a: '', b: '', same: true } : { a: xA, b: xB, same: false };
     for (const key of ['DirectiveType', 'IsEnabled', 'Sequence']) {
         const va = String(da[key] ?? ''), vb = String(db[key] ?? ''), same = va === vb;
         if (!same) hasDiff = true;
@@ -292,6 +299,9 @@ class ComparePanel {
 
     async _runFunctionsCompare({ profileA, companyA, profileB, companyB }) {
         this._post({ command: 'status', text: 'Building clients…' });
+        // New compare run — drop layer content cached from the previous run
+        // (the webview clears its own caches; this one grew unbounded).
+        this._layerCache.clear();
         try {
             const [cA, cB] = await Promise.all([this._efxClient(profileA, companyA), this._efxClient(profileB, companyB)]);
             this._post({ command: 'status', text: 'Fetching library lists…' });
@@ -326,17 +336,34 @@ class ComparePanel {
             // 2. GetRowsEx per service with specific where clause
             const fetchAll = async (bpm) => {
                 const services = await bpm.getBpmServices();
+                // Fetch per-service rows with limited concurrency — the old serial
+                // loop made compare time = service count × round-trip latency.
+                const CONCURRENCY = 6;
+                const results = new Array(services.length);
+                let next = 0;
+                const worker = async () => {
+                    while (next < services.length) {
+                        const i = next++;
+                        const { SystemCode, ServiceKind, ServiceName } = services[i];
+                        results[i] = await bpm.getBpmMethodsByService(SystemCode, ServiceKind, ServiceName);
+                    }
+                };
+                await Promise.all(Array.from({ length: Math.min(CONCURRENCY, services.length) }, worker));
                 const methods = [], directives = [];
-                for (const svc of services) {
-                    const { SystemCode, ServiceKind, ServiceName } = svc;
-                    const data = await bpm.getBpmMethodsByService(SystemCode, ServiceKind, ServiceName);
+                for (const data of results) {
                     methods.push(...data.methods);
                     for (const d of data.directives) {
                         const { code, hasCustomCode } = extractBpmCode(d.Body || '');
+                        // Semantic representation via the real XAML parser: every
+                        // node, every code block, conditions, bindings, edges —
+                        // with designer noise (positions, x:Name churn) excluded.
+                        // Falls back to raw formatted XAML when not parseable.
+                        const canon = directiveToCanonicalText(d.Body || '');
                         directives.push({
                             BpMethodCode: d.BpMethodCode, Name: d.Name,
                             DirectiveType: d.DirectiveType, IsEnabled: d.IsEnabled,
                             Sequence: d.Sequence, _code: code, hasCode: hasCustomCode,
+                            _bodyNorm: canon ?? formatBpmBodyXaml(d.Body || ''),
                         });
                     }
                 }
@@ -358,6 +385,13 @@ class ComparePanel {
         try {
             const [cA, cB] = await Promise.all([this._metafxClient(profileA, companyA), this._metafxClient(profileB, companyB)]);
             const [appsA, appsB] = await Promise.all([cA.listApps(), cB.listApps()]);
+            // Diagnostic: GetApplications is called with IncludeAllLayers:true — if
+            // the rows already embed per-app layer lists, the per-app GetLayers
+            // round-trips could be skipped entirely. Check the dev console for this.
+            const embedded = appsA[0] && Object.entries(appsA[0]).find(([, v]) =>
+                Array.isArray(v) && v.length > 0 && typeof v[0] === 'object' && v[0] !== null
+                && ('LayerName' in v[0] || 'LayerDescription' in v[0]));
+            if (embedded) console.log('[comparePanel] GetApplications embeds layers under key "' + embedded[0] + '" — GetLayers per app may be skippable');
             const mapA = new Map(appsA.map(a => [a.Id, a]));
             const mapB = new Map(appsB.map(a => [a.Id, a]));
             const allIds = [...new Set([...mapA.keys(), ...mapB.keys()])].sort();
@@ -390,12 +424,13 @@ class ComparePanel {
         this._post({ command: 'layerListLoading', appId });
         try {
             const [cA, cB] = await Promise.all([this._metafxClient(profileA, companyA), this._metafxClient(profileB, companyB)]);
-            const [layersA, layersB] = await Promise.all([
-                cA.getLayers(appId).catch(e => { console.error('[layers A]', e.message); return []; }),
-                cB.getLayers(appId).catch(e => { console.error('[layers B]', e.message); return []; }),
+            // Capture per-env failures instead of silently rendering "0 layers"
+            const [resA, resB] = await Promise.all([
+                cA.getLayers(appId).then(layers => ({ layers })).catch(e => { console.error('[layers A]', e.message); return { layers: [], error: e.message }; }),
+                cB.getLayers(appId).then(layers => ({ layers })).catch(e => { console.error('[layers B]', e.message); return { layers: [], error: e.message }; }),
             ]);
-            this._post({ command: 'status', text: `Layers for ${appId}: ${profileA}=${layersA.length}, ${profileB}=${layersB.length}` });
-            this._post({ command: 'layerListReady', appId, layersA, layersB });
+            this._post({ command: 'status', text: `Layers for ${appId}: ${profileA}=${resA.error ? 'ERROR' : resA.layers.length}, ${profileB}=${resB.error ? 'ERROR' : resB.layers.length}` });
+            this._post({ command: 'layerListReady', appId, layersA: resA.layers, layersB: resB.layers, errorA: resA.error || null, errorB: resB.error || null });
         } catch (err) {
             this._post({ command: 'layerListError', appId, message: err.message });
         }
@@ -898,7 +933,41 @@ let PENDING_DIFF        = null; // { appId, layerKey } -- open native diff once 
 
 // ── HELPERS ───────────────────────────────────────────────────────────
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function looksLikeBinary(s) { return !!s && s.length > 20 && /^[A-Za-z0-9+/]+=*$/.test(s); }
+// Only treat genuinely blob-like strings as binary. The old 20-char threshold
+// misclassified ordinary alphanumeric layer names (e.g. "CustomerPortalLayerV2"),
+// collapsing every such layer onto its TypeCode key and silently dropping rows.
+function looksLikeBinary(s) { return !!s && s.length > 64 && /^[A-Za-z0-9+/]+=*$/.test(s); }
+// Stable cross-env identity for a layer. Prefer LayerName (stable) over
+// LayerDescription (often version-stamped per save, so the same logical layer
+// has different descriptions in each environment), then qualify with Company
+// and DeviceType so same-named layers in different scopes never collide.
+function layerBaseName(l) {
+  const n = l.LayerName;        if (n && !looksLikeBinary(n)) return n;
+  const d = l.LayerDescription; if (d && !looksLikeBinary(d)) return d;
+  return l.TypeCode || '?';
+}
+// Key every layer row uniquely — residual duplicates (e.g. published + WIP
+// rows of the same layer) get a #2/#3 suffix instead of overwriting each
+// other during Map construction. Deterministic for a given input array, so
+// the keys built in layerListReady match the ones built in renderLayerList.
+// Placeholder rows with no identity and no content occasionally come back from
+// GetLayers — hide them; they render as "?" and waste a content fetch per click.
+// (GetLayers is a method call, not an OData entity set, so there is no
+// server-side $filter — filtering here costs nothing since the rows already
+// arrived in the same response.)
+function isBlankLayer(l) {
+  return !l.LayerName && !l.LayerDescription && !l.Content && !l.HasDraftContent;
+}
+function layerEntries(layers) {
+  const used = new Map();
+  return (layers || []).filter(l => !isBlankLayer(l)).map(l => {
+    let key = [layerBaseName(l), l.Company || '', l.DeviceType || ''].filter(Boolean).join(' · ');
+    const n = used.get(key) || 0;
+    used.set(key, n + 1);
+    if (n > 0) key += ' #' + (n + 1);
+    return { key: key, layer: l };
+  });
+}
 function setStatus(text){ document.getElementById('statusBar').textContent = text || ''; }
 
 // ── PROFILES ──────────────────────────────────────────────────────────
@@ -1038,14 +1107,9 @@ window.addEventListener('message', ({ data: msg }) => {
         document.getElementById('layersDetail').innerHTML = '<div class="empty-state"><span>Loading layers…</span></div>';
       break;
     case 'layerListReady': {
-            const lkFn = l => {
-        const d = l.LayerDescription; if (d && !looksLikeBinary(d)) return d;
-        const n = l.LayerName;        if (n && !looksLikeBinary(n)) return n;
-        return l.TypeCode || '?';
-      };
-      for (const l of (msg.layersA||[])) LAYER_OBJECTS[\`\${msg.appId}::\${lkFn(l)}::a\`] = l;
-      for (const l of (msg.layersB||[])) LAYER_OBJECTS[\`\${msg.appId}::\${lkFn(l)}::b\`] = l;
-      LAYER_LIST_CACHE[msg.appId] = { layersA: msg.layersA, layersB: msg.layersB };
+      for (const e of layerEntries(msg.layersA)) LAYER_OBJECTS[msg.appId + '::' + e.key + '::a'] = e.layer;
+      for (const e of layerEntries(msg.layersB)) LAYER_OBJECTS[msg.appId + '::' + e.key + '::b'] = e.layer;
+      LAYER_LIST_CACHE[msg.appId] = { layersA: msg.layersA, layersB: msg.layersB, errorA: msg.errorA, errorB: msg.errorB };
       if (LY_SEL === msg.appId) renderLayerList(msg.appId);
       break;
     }
@@ -1406,12 +1470,15 @@ function renderBpmDirBody(dir, ea, eb) {
   }
   const fid = esc(dir.name);
   const codeDiff = dir.fields?.Code && !dir.fields.Code.same;
+  const xamlDiff = dir.fields?.Xaml && !dir.fields.Xaml.same;
   const metaDiff = ['DirectiveType','IsEnabled','Sequence'].some(k=>dir.fields?.[k]&&!dir.fields[k].same);
   return \`<div class="tabs">
     <button class="tab active" onclick="switchFnTab(this,'\${fid}','code')">Code\${codeDiff?' ⚡':''}</button>
+    \${xamlDiff?\`<button class="tab" onclick="switchFnTab(this,'\${fid}','xaml')">Widgets ⚡</button>\`:''}
     <button class="tab"        onclick="switchFnTab(this,'\${fid}','meta')">Settings\${metaDiff?' ⚡':''}</button>
   </div>
   <div class="pane active" data-fn="\${fid}" data-tab="code">\${sideBySide(dir.fields?.Code?.a||'',dir.fields?.Code?.b||'',ea,eb)}</div>
+  \${xamlDiff?\`<div class="pane" data-fn="\${fid}" data-tab="xaml">\${sideBySide(dir.fields.Xaml.a||'',dir.fields.Xaml.b||'',ea,eb)}</div>\`:''}
   <div class="pane" data-fn="\${fid}" data-tab="meta">
     <table class="meta-tbl"><thead><tr><th>Field</th><th style="color:var(--c-only-a)">\${ea}</th><th style="color:var(--c-only-b)">\${eb}</th></tr></thead><tbody>\${
       ['DirectiveType','IsEnabled','Sequence'].map(k=>{ const f=dir.fields?.[k]; if(!f) return '';
@@ -1481,13 +1548,10 @@ function renderLayerList(appId) {
   const { layersA, layersB } = cache;
   const ea = LAST_RUN.profileA, eb = LAST_RUN.profileB;
   const app = LY_DATA?.apps.find(a=>a.id===appId);
-        const lkFn = l => {
-        const d = l.LayerDescription; if (d && !looksLikeBinary(d)) return d;
-        const n = l.LayerName;        if (n && !looksLikeBinary(n)) return n;
-        return l.TypeCode || '?';
-      };
-  const mapA = new Map((layersA||[]).map(l=>[lkFn(l),l]));
-  const mapB = new Map((layersB||[]).map(l=>[lkFn(l),l]));
+  // layerEntries gives every row a unique key, so Map construction can no
+  // longer drop layers that share a name (device/company/WIP variants).
+  const mapA = new Map(layerEntries(layersA).map(e=>[e.key,e.layer]));
+  const mapB = new Map(layerEntries(layersB).map(e=>[e.key,e.layer]));
   const allKeys = [...new Set([...mapA.keys(),...mapB.keys()])].sort();
   const rows = allKeys.map(key => ({ key, lA: mapA.get(key)||null, lB: mapB.get(key)||null }));
 
@@ -1499,10 +1563,15 @@ function renderLayerList(appId) {
     <div style="font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--vscode-descriptionForeground);margin-bottom:4px">App\${app?.subType?' · '+esc(app.subType):''}</div>
     <div class="detail-title" title="\${esc(appId)}">\${esc(appId)}</div>
     <div class="detail-meta">
-      <span style="color:var(--c-only-a)">● \${esc(ea)}: \${(layersA||[]).length} layer\${(layersA||[]).length!==1?'s':''}</span>
-      <span style="color:var(--c-only-b)">● \${esc(eb)}: \${(layersB||[]).length} layer\${(layersB||[]).length!==1?'s':''}</span>
+      <span style="color:var(--c-only-a)">● \${esc(ea)}: \${mapA.size} layer\${mapA.size!==1?'s':''}\${(layersA||[]).length>mapA.size?' ('+((layersA||[]).length-mapA.size)+' blank hidden)':''}</span>
+      <span style="color:var(--c-only-b)">● \${esc(eb)}: \${mapB.size} layer\${mapB.size!==1?'s':''}\${(layersB||[]).length>mapB.size?' ('+((layersB||[]).length-mapB.size)+' blank hidden)':''}</span>
     </div>
   </div><div class="fn-section">\`;
+
+  // Surface per-environment fetch failures — a failed GetLayers is not the
+  // same thing as "this environment has 0 layers".
+  if (cache.errorA) html += '<div class="err-banner">⚠ ' + esc(ea) + ' GetLayers failed: ' + esc(cache.errorA) + '</div>';
+  if (cache.errorB) html += '<div class="err-banner">⚠ ' + esc(eb) + ' GetLayers failed: ' + esc(cache.errorB) + '</div>';
 
   if (!rows.length) {
     html += '<div class="no-results">No layers found on either environment</div>';
@@ -1536,6 +1605,8 @@ function renderLayerRow(row, appId, ea, eb) {
   const meta = lA || lB;
   const typeLabel = meta?.TypeCode ? \`<span style="opacity:.5;font-size:10px"> [\${esc(meta.TypeCode)}]</span>\` : '';
   const compLabel = meta?.Company  ? \`<span class="list-delta">\${esc(meta.Company)}</span>\` : '';
+  const wipLabel  = (lA?.IsPublished === false || lB?.IsPublished === false)
+    ? '<span style="opacity:.8;font-size:10px;color:var(--c-diff)"> [WIP]</span>' : '';
 
   const diffBtn   = (inA && inB)
     ? \`<button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openLayerDiff('\${esc(appId)}','\${esc(key)}')">↗ Diff</button>\`
@@ -1550,7 +1621,7 @@ function renderLayerRow(row, appId, ea, eb) {
   return \`<div class="fn-row" id="\${rid}">
     <div class="fn-row-hdr" onclick="toggleFn('\${rid}');loadLayerContent('\${esc(appId)}','\${esc(key)}')">
       <span class="fn-badge" style="background:\${sc[status]}22;color:\${sc[status]}">\${sb[status]}</span>
-      <span class="fn-name">\${esc(key)}\${typeLabel}</span>
+      <span class="fn-name">\${esc(key)}\${typeLabel}\${wipLabel}</span>
       \${compLabel}
       \${diffBtn}\${applyAtoB}\${applyBtoA}
       <span class="chevron">▶</span>
@@ -1613,7 +1684,17 @@ function openBpmDirDiff(methodCode, dirName) {
     for (const m of (svc.methods||[])) {
       if (m.methodCode !== methodCode) continue;
       const d = (m.dirDiffs||[]).find(x=>x.name===dirName);
-      if (d) { sendDiff(d.da?._code||'', d.db?._code||'', dirName.replace(/[^a-zA-Z0-9._-]/g,'_')+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB); return; }
+      if (!d) continue;
+      const safe = dirName.replace(/[^a-zA-Z0-9._-]/g,'_');
+      const hasCode = !!((d.da?._code) || (d.db?._code));
+      // Widget-only directives have no C# code — diff the XAML instead of
+      // opening two empty documents.
+      if (!hasCode && d.fields?.Xaml && !d.fields.Xaml.same) {
+        sendDiff(d.fields.Xaml.a||'', d.fields.Xaml.b||'', safe+'.widgets.txt', LAST_RUN?.profileA, LAST_RUN?.profileB);
+      } else {
+        sendDiff(d.da?._code||'', d.db?._code||'', safe+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB);
+      }
+      return;
     }
   }
 }
@@ -1647,26 +1728,53 @@ function sideBySide(textA, textB, labelA, labelB) {
 }
 
 function lcs(A, B) {
-  const n = A.length, m = B.length;
-  if (n > 800 || m > 800) return [...A.map(v=>({t:'-',v})), ...B.map(v=>({t:'+',v}))];
-  const dp = Array.from({length:n+1},()=>new Int32Array(m+1));
-  for (let i=n-1;i>=0;i--) for (let j=m-1;j>=0;j--) dp[i][j]=A[i]===B[j]?dp[i+1][j+1]+1:Math.max(dp[i+1][j],dp[i][j+1]);
-  const out=[]; let i=0,j=0;
-  while(i<n||j<m){
-    if(i<n&&j<m&&A[i]===B[j]){out.push({t:'=',v:A[i]});i++;j++;}
-    else if(j<m&&(i>=n||dp[i][j+1]>=dp[i+1][j])){out.push({t:'+',v:B[j]});j++;}
-    else{out.push({t:'-',v:A[i]});i++;}
+  // Trim the common prefix/suffix first — layer JSONs and function bodies are
+  // mostly identical, so the O(n·m) alignment only needs to run on the changed
+  // middle. The old version bailed out entirely past 800 lines and rendered
+  // "all of A deleted, then all of B added" — the misaligned stacked view.
+  let pre = 0;
+  while (pre < A.length && pre < B.length && A[pre] === B[pre]) pre++;
+  let suf = 0;
+  while (suf < A.length - pre && suf < B.length - pre && A[A.length-1-suf] === B[B.length-1-suf]) suf++;
+  const midA = A.slice(pre, A.length - suf), midB = B.slice(pre, B.length - suf);
+  const n = midA.length, m = midB.length;
+  let aligned;
+  if (n === 0 && m === 0) {
+    aligned = [];
+  } else if (n > 2500 || m > 2500) {
+    // Genuinely massive changed region — alignment too expensive; the
+    // native ↗ Diff button handles these properly.
+    aligned = [...midA.map(v=>({t:'-',v})), ...midB.map(v=>({t:'+',v}))];
+  } else {
+    const dp = Array.from({length:n+1},()=>new Int32Array(m+1));
+    for (let i=n-1;i>=0;i--) for (let j=m-1;j>=0;j--) dp[i][j]=midA[i]===midB[j]?dp[i+1][j+1]+1:Math.max(dp[i+1][j],dp[i][j+1]);
+    aligned=[]; let i=0,j=0;
+    while(i<n||j<m){
+      if(i<n&&j<m&&midA[i]===midB[j]){aligned.push({t:'=',v:midA[i]});i++;j++;}
+      else if(j<m&&(i>=n||dp[i][j+1]>=dp[i+1][j])){aligned.push({t:'+',v:midB[j]});j++;}
+      else{aligned.push({t:'-',v:midA[i]});i++;}
+    }
   }
+  const out=[...A.slice(0,pre).map(v=>({t:'=',v})), ...aligned, ...A.slice(A.length-suf).map(v=>({t:'=',v}))];
   const CTX=3, result=[];
   let equalRun=[];
+  // Collapse long equal runs into a skip row, keeping CTX context lines on the
+  // sides that touch a change. Every line is accounted for exactly once — the
+  // old version double-pushed short trailing runs and dropped end-of-file runs
+  // without a skip marker, which corrupted the line numbers.
   function flush(last){
     if(!equalRun.length) return;
     if(result.length===0&&last){result.push(...equalRun);equalRun=[];return;}
-    if(result.length>0) result.push(...equalRun.slice(0,CTX));
-    const mid=equalRun.length-CTX*2;
-    if(!last&&mid>0) result.push({t:'skip',v:\`… \${mid} unchanged lines …\`,countA:mid,countB:mid});
-    if(!last) result.push(...equalRun.slice(-CTX));
-    else result.push(...equalRun.slice(Math.max(0,equalRun.length-CTX)));
+    const head = result.length>0 ? CTX : 0; // context after a change
+    const tail = last ? 0 : CTX;            // context before the next change
+    if (equalRun.length <= head + tail) {
+      result.push(...equalRun);
+    } else {
+      if (head) result.push(...equalRun.slice(0, head));
+      const midCount = equalRun.length - head - tail;
+      result.push({t:'skip',v:'… '+midCount+' unchanged lines …',countA:midCount,countB:midCount});
+      if (tail) result.push(...equalRun.slice(-tail));
+    }
     equalRun=[];
   }
   for(const d of out){ if(d.t==='=') equalRun.push(d); else{flush(false);result.push(d);} }
