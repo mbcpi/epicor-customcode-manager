@@ -157,20 +157,40 @@ class KineticMetaFXClient {
             request: { ViewId: viewId, IncludeUnpublishedLayers: true },
         });
         const obj = result?.returnObj;
+        // An array "looks like layers" when its rows carry layer fields — this
+        // stops an empty OData artifact (e.g. "value": []) from shadowing the
+        // real layer list that sits under a different key.
+        const isLayerArray = a => Array.isArray(a) && a.length > 0 && typeof a[0] === 'object' && a[0] !== null
+            && ('LayerName' in a[0] || 'LayerDescription' in a[0] || 'TypeCode' in a[0]);
         if (Array.isArray(obj)) return obj;
         if (obj && typeof obj === 'object') {
             const KNOWN_KEYS = ['Layers', 'layers', 'EpMetaFXLayerForApplicationList', 'LayerList',
                                 'value', 'Value', 'data', 'Data', 'items', 'Items', 'Result', 'result',
                                 'EpMetaFXLayerList', 'AppLayerList', 'LayerDescriptors'];
+            // Pass 1: known keys whose content is recognisably a layer list
             for (const k of KNOWN_KEYS) {
-                if (Array.isArray(obj[k])) return obj[k];
+                if (isLayerArray(obj[k])) return obj[k];
             }
-            // Last resort: first array-valued property
+            // Pass 2: any property holding a recognisable layer list
             for (const [k, v] of Object.entries(obj)) {
-                if (Array.isArray(v)) {
+                if (isLayerArray(v)) {
+                    console.error("[MetaFX] GetLayers used layer-shaped fallback key:", k, "shape keys:", Object.keys(obj));
+                    return v;
+                }
+            }
+            // Pass 3: non-empty arrays that didn't match the layer shape (old behavior, minus empty-array shadowing)
+            for (const k of KNOWN_KEYS) {
+                if (Array.isArray(obj[k]) && obj[k].length > 0) return obj[k];
+            }
+            for (const [k, v] of Object.entries(obj)) {
+                if (Array.isArray(v) && v.length > 0) {
                     console.error("[MetaFX] GetLayers used fallback key:", k, "shape keys:", Object.keys(obj));
                     return v;
                 }
+            }
+            // Pass 4: only empty arrays present — legitimately no layers
+            for (const k of KNOWN_KEYS) {
+                if (Array.isArray(obj[k])) return obj[k];
             }
         }
         if (obj != null) console.error("[MetaFX] GetLayers returnObj (no array found):", JSON.stringify(obj).slice(0, 600));

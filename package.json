@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.6.5",
+	"version": "0.6.6",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -398,7 +398,7 @@
 	},
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
-		"compile": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs",
+		"compile": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
 		"deploy": "npm run compile && cp out/extension.js /Users/micahbragg-cpi/.antigravity/extensions/micah-bragg.epicor-efx-manager-0.5.0/out/extension.js",
 		"watch": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
 		"package": "npx @vscode/vsce package"

@@ -481,4 +481,71 @@ function setActionField(bodyXml, nodeId, expressionText, fieldInfo) {
     return new XMLSerializer().serializeToString(parsed.doc);
 }
 
-module.exports = { parseDirective, setNodeCode, setRaiseExceptionMessage, setNodeAttrs, setConditionChildren, setInvokeFunctionAction, setActionField };
+// ─── Canonical text rendering (for semantic diffs) ────────────────────────────
+// Renders a directive as deterministic, position-free text: nodes in walk order
+// with their meaningful attributes, ALL code blocks (not just the first),
+// conditions, bindings, and flow edges. Cosmetic designer state — widget x/y,
+// x:Name identity, row bookkeeping — is excluded, so two functionally identical
+// directives render identically even if widgets were dragged around.
+
+const CANON_SKIP_ATTRS = new Set([
+    'Id', 'ValidationState', 'IsNewRow', 'RowMod', 'BitFlag', 'SysRevID', 'SysRowID',
+    'Code', // rendered as an indented block below the node header
+]);
+
+function canonWidgetLines(w, indent) {
+    const out = [];
+    if (!w) { out.push(indent + '(no widget)'); return out; }
+    const attrs = Object.entries(w.attrs || {})
+        .filter(([k]) => !k.startsWith('xmlns') && !k.startsWith('x:') && !CANON_SKIP_ATTRS.has(k))
+        .sort(([a], [b]) => a.localeCompare(b));
+    for (const [k, v] of attrs) out.push(indent + k + ' = ' + v);
+    if (w.message != null) out.push(indent + 'Message = ' + w.message);
+    if (w.actionFieldInfo) out.push(indent + 'Field = ' + (w.actionFieldInfo.tableName || '') + '.' + (w.actionFieldInfo.columnName || ''));
+    if (w.actionExpressionText != null) out.push(indent + 'Expression = ' + w.actionExpressionText);
+    for (const pb of (w.paramBindings || [])) {
+        out.push(indent + 'Param ' + pb.paramDirection + ' ' + pb.paramName + ' <-> ' + pb.variableName);
+    }
+    (w.conditions || []).forEach((c, i) => {
+        const parts = [];
+        if (i > 0) parts.push(c.itemOperator);
+        parts.push(c.localName);
+        if (c.fieldInfo) parts.push((c.fieldInfo.tableName || '') + '.' + (c.fieldInfo.columnName || ''));
+        if (c.attrs && c.attrs.Operator) parts.push(c.attrs.Operator);
+        if (c.expressionText != null) parts.push(c.expressionText);
+        if (c.attrs && c.attrs.Filter !== undefined) parts.push('[' + c.attrs.Filter + ']');
+        out.push(indent + 'Condition ' + (i + 1) + ': ' + parts.join(' '));
+        if (c.attrs && c.attrs.Code) {
+            for (const line of String(c.attrs.Code).split('\n')) out.push(indent + '  | ' + line);
+        }
+    });
+    if (w.code != null) {
+        out.push(indent + 'Code:');
+        for (const line of String(w.code).split('\n')) out.push(indent + '  | ' + line);
+    }
+    return out;
+}
+
+// Returns canonical text, or null when the body isn't a parseable widget
+// directive (caller should fall back to a raw representation).
+function directiveToCanonicalText(bodyXml) {
+    let parsed;
+    try { parsed = parseDirective(bodyXml); } catch { return null; }
+    if (!parsed || parsed.nodes.length === 0) return null;
+    // Nodes are numbered by walk order from the start node, so x:Name churn
+    // between environments doesn't affect the output.
+    const num = new Map(parsed.nodes.map((n, i) => [n.id, i + 1]));
+    const tgt = id => (id == null ? '(end)' : '[' + (num.get(id) ?? '?') + ']');
+    const out = [];
+    parsed.nodes.forEach((n, i) => {
+        out.push('[' + (i + 1) + '] ' + (n.type === 'condition' ? 'Condition' : 'Step') + ': ' + (n.widget?.label || n.widget?.localName || '(unknown)'));
+        out.push(...canonWidgetLines(n.widget, '    '));
+        for (const e of parsed.edges.filter(e => e.from === n.id)) {
+            out.push('    ' + (e.label ? e.label + ' -> ' : '-> ') + tgt(e.to));
+        }
+        out.push('');
+    });
+    return out.join('\n');
+}
+
+module.exports = { parseDirective, setNodeCode, setRaiseExceptionMessage, setNodeAttrs, setConditionChildren, setInvokeFunctionAction, setActionField, directiveToCanonicalText };

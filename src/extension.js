@@ -272,15 +272,37 @@ function severityFromCode(code) {
     return vscode.DiagnosticSeverity.Error;
 }
 function stripGeneratedHeader(fileContent) {
+    return stripGeneratedHeaderInfo(fileContent).content;
+}
+
+// Returns { content, lineOffset } where lineOffset is the number of lines the
+// header strip removed. Compiler diagnostics are positioned against the
+// STRIPPED code, so every editor squiggle must be shifted down by lineOffset.
+function stripGeneratedHeaderInfo(fileContent) {
     const lines = fileContent.split(/\r?\n/);
 
-    const markerIndex = lines.findIndex(line =>
+    // Only strip a header this extension wrote. The file must START with a
+    // generated comment line ("// EFx Function:" or "// BPM Directive:") and
+    // the divider must appear inside that leading comment block. A divider
+    // comment in user code (e.g. "// ----- Helpers -----") must never trigger
+    // stripping — that would silently truncate everything above it on push.
+    if (!/^\/\/ (EFx Function|BPM Directive):/.test(lines[0] || "")) {
+        return { content: fileContent, lineOffset: 0 };
+    }
+
+    const isMarker = line =>
         line.startsWith("// ─────") ||
-        line.startsWith("// -----")
-    );
+        line.startsWith("// -----");
+
+    let markerIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+        if (isMarker(lines[i])) { markerIndex = i; break; }
+        // Still inside the header block? Only comment or blank lines qualify.
+        if (!lines[i].startsWith("//") && lines[i].trim() !== "") break;
+    }
 
     if (markerIndex < 0) {
-        return fileContent;
+        return { content: fileContent, lineOffset: 0 };
     }
 
     const markerLine = lines[markerIndex];
@@ -306,10 +328,12 @@ function stripGeneratedHeader(fileContent) {
     const remainingLines = lines.slice(markerIndex + 1);
 
     if (gluedRemainder) {
-        return [gluedRemainder, ...remainingLines].join("\n");
+        // The glued text becomes a new first line replacing the marker line,
+        // so only markerIndex lines were actually removed.
+        return { content: [gluedRemainder, ...remainingLines].join("\n"), lineOffset: markerIndex };
     }
 
-    return remainingLines.join("\n");
+    return { content: remainingLines.join("\n"), lineOffset: markerIndex + 1 };
 }
 function normalizeCodeForCompare(code) {
     return String(code || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -461,7 +485,11 @@ function activate(context) {
                     // Fetch a fresh parsed tableset for current metadata/Usings.
                     // The wrapper pulls the final live tableset server-side before applying changes,
                     // so the extension no longer posts raw ApplyChangesWithDiagnostics for function saves.
-                    const freshTableset = await client.getLibrary(libraryId);
+                    // Reuse the tree cache when present — every mutation path calls
+                    // invalidateCache(), so a hit is current enough for the Frozen
+                    // check and Usings (and the wrapper still fetches live anyway).
+                    const freshTableset = treeProvider.libraryCache.get(libraryId)
+                        || await client.getLibrary(libraryId);
 
                     const libraryRow = freshTableset.EfxLibrary && freshTableset.EfxLibrary[0];
                     if (!libraryRow) {
@@ -476,8 +504,9 @@ function activate(context) {
                     }
 
                     // Read edited code.
-                    let fileContent = fs.readFileSync(filePath, "utf-8");
-                    fileContent = stripGeneratedHeader(fileContent);
+                    const strippedPush = stripGeneratedHeaderInfo(fs.readFileSync(filePath, "utf-8"));
+                    const fileContent = strippedPush.content;
+                    const headerOffset = strippedPush.lineOffset;
 
                     // Find function row.
                     const funcRow = freshTableset.EfxFunction.find(f => f.FunctionID === functionId);
@@ -504,10 +533,13 @@ function activate(context) {
                         if (diagnostics.length > 0) {
                             const vsDiags = diagnostics.map(d => {
                                 if (typeof d === 'object' && d !== null) {
-                                    const line = Math.max(0, (d.Line ?? 1) - 1);
+                                    // Compiler positions are relative to the stripped
+                                    // code — shift down by the removed header lines.
+                                    const line = Math.max(0, (d.Line ?? 1) - 1) + headerOffset;
+                                    const col = Math.max(0, (d.Column ?? 1) - 1);
                                     const msg = [d.Code, d.Message].filter(Boolean).join(': ') || String(d);
                                     return new vscode.Diagnostic(
-                                        new vscode.Range(line, 0, line, 1),
+                                        new vscode.Range(line, col, line, col + 1),
                                         msg,
                                         vscode.DiagnosticSeverity.Error
                                     );
@@ -1435,17 +1467,22 @@ function activate(context) {
             const openDoc = vscode.workspace.textDocuments.find(
                 d => normalizeFsPath(d.uri.fsPath) === normalizeFsPath(filePath)
             );
-            let code = openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf-8');
-            code = stripGeneratedHeader(code);
+            const strippedBpm = stripGeneratedHeaderInfo(openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf-8'));
+            const code = strippedBpm.content;
+            const headerOffset = strippedBpm.lineOffset;
             const diagnostics = await bpmClientInst.validateCustomCode(code, mapping.functionDefinition);
             const uri = vscode.Uri.file(filePath);
             if (!diagnostics || diagnostics.length === 0) {
                 bpmDiagnostics.set(uri, []);
             } else {
                 const vsDiags = diagnostics.map(d => {
-                    const startLine = Math.max(0, (d.Span?.start?.line ?? 1) - 1);
+                    // Spans are relative to the stripped code — shift down by
+                    // the removed header lines so squiggles land on the right line.
+                    const rawStart = Math.max(0, (d.Span?.start?.line ?? 1) - 1);
+                    const rawEnd = Math.max(rawStart, (d.Span?.end?.line ?? rawStart + 1) - 1);
+                    const startLine = rawStart + headerOffset;
+                    const endLine = rawEnd + headerOffset;
                     const startCol = Math.max(0, d.Span?.start?.column ?? 0);
-                    const endLine = Math.max(0, (d.Span?.end?.line ?? startLine + 1) - 1);
                     const endCol = Math.max(0, d.Span?.end?.column ?? startCol + 1);
                     const range = new vscode.Range(startLine, startCol, endLine, endCol);
                     const severity = severityFromCode(d.Severity);
@@ -1561,8 +1598,9 @@ function activate(context) {
             const openDoc = vscode.workspace.textDocuments.find(
                 d => normalizeFsPath(d.uri.fsPath) === normalizeFsPath(filePath)
             );
-            let code = openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf-8');
-            code = stripGeneratedHeader(code);
+            const strippedEfx = stripGeneratedHeaderInfo(openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf-8'));
+            const code = strippedEfx.content;
+            const headerOffset = strippedEfx.lineOffset;
 
                 // ── No-change guard: skip network call if code matches cache ──
                 const cachedTableset = pulledTablesets.get(mapping.libraryId);
@@ -1586,7 +1624,8 @@ function activate(context) {
                     code,
                     usings,
                     'Utilities',
-                    'ApplyChangesWithDiagnostics'
+                    'ApplyChangesWithDiagnostics',
+                    cachedTableset // avoid re-downloading the full library every debounce
                 );
 
                 // ── Cache sync: if Epicor accepted the save, update local cache ──
@@ -1601,12 +1640,17 @@ function activate(context) {
                     efxDiagnostics.set(uri, []);
                 } else {
                 const vsDiags = diagnostics.map(d => {
-                    // Structured object — what ApplyChangesWithDiagnostics actually returns
+                    // Structured object — what ApplyChangesWithDiagnostics actually returns.
+                    // All positions are relative to the STRIPPED code; shift down by
+                    // the removed header lines so squiggles land on the right line.
                     if (typeof d === 'object' && d !== null) {
                         const parsedLine = Number.isInteger(d.Line) ? d.Line : undefined;
-                        const startLine = Math.max(0, (d.Span?.start?.line ?? parsedLine ?? 1) - 1);
-                        const startCol = Math.max(0, d.Span?.start?.column ?? 0);
-                        const endLine = Math.max(0, (d.Span?.end?.line ?? parsedLine ?? startLine + 1) - 1);
+                        const parsedCol = Number.isInteger(d.Column) ? d.Column - 1 : undefined;
+                        const rawStart = Math.max(0, (d.Span?.start?.line ?? parsedLine ?? 1) - 1);
+                        const rawEnd = Math.max(rawStart, (d.Span?.end?.line ?? parsedLine ?? rawStart + 1) - 1);
+                        const startLine = rawStart + headerOffset;
+                        const endLine = rawEnd + headerOffset;
+                        const startCol = Math.max(0, d.Span?.start?.column ?? parsedCol ?? 0);
                         const endCol = Math.max(0, d.Span?.end?.column ?? startCol + 1);
                         const severity = severityFromCode(d.Severity);
                         const msg = [d.Code, d.Message].filter(Boolean).join(': ');
@@ -1619,7 +1663,7 @@ function activate(context) {
                     // Fallback: plain string "(line,col): error CSxxxx: msg"
                     const m = String(d).match(/\((\d+),(\d+)\).*?(error|warning|info)\s+(CS\w+)?:?\s*(.*)/i);
                     if (m) {
-                        const line = Math.max(0, parseInt(m[1]) - 1);
+                        const line = Math.max(0, parseInt(m[1]) - 1) + headerOffset;
                         const col = Math.max(0, parseInt(m[2]) - 1);
                         const sev = m[3].toLowerCase();
                         return new vscode.Diagnostic(

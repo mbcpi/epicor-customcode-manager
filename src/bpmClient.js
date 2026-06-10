@@ -25,13 +25,13 @@ function xmlEncode(str) {
 
 function xmlDecode(str) {
     return str
-        .replace(/&#xA;/g, '\n')
-        .replace(/&#xD;/g, '\r')
-        .replace(/&#x9;/g, '\t')
+        .replace(/&#xA;/gi, '\n')
+        .replace(/&#xD;/gi, '\r')
+        .replace(/&#x9;/gi, '\t')
         .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>');
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&'); // MUST be last — decoding &amp; first double-decodes "&amp;lt;" into "<"
 }
 exports.xmlDecode = xmlDecode;
 exports.xmlEncode = xmlEncode;
@@ -87,6 +87,16 @@ function replaceBpmCode(body, newCode) {
     return body.slice(0, valueStart) + xmlEncode(newCode) + body.slice(valueEnd);
 }
 exports.replaceBpmCode = replaceBpmCode;
+
+// Pretty-print a BPM Body XAML string for line-based diffing: one element per
+// line. Purely cosmetic — attributes and content are preserved exactly as
+// stored (encoded code inside attributes contains no raw "><", so it never
+// gets split). Shared by the compare panel and any future XAML views.
+function formatBpmBodyXaml(body) {
+    if (!body) return '';
+    return String(body).replace(/></g, '>\n<');
+}
+exports.formatBpmBodyXaml = formatBpmBodyXaml;
 
 // Find a BpDirective row in the raw tableset by DirectiveID,
 // replace its Code= attribute in Body, and set RowMod to "U".
