@@ -76,6 +76,12 @@
 				"category": "EFx"
 			},
 			{
+				"command": "efx.changeStorageLocation",
+				"title": "Change Storage Location",
+				"icon": "$(folder)",
+				"category": "EFx"
+			},
+			{
 				"command": "efx.pullFunction",
 				"title": "Pull Function Code",
 				"icon": "$(cloud-download)",
@@ -392,6 +398,11 @@
 					"type": "string",
 					"default": "",
 					"description": "Currently selected company within the active profile"
+				},
+				"efx.storageLocation": {
+					"type": "string",
+					"default": "",
+					"description": "Folder where pulled functions and BPM directives are cached, organized by profile (e.g. <folder>/Dev/Libraries/...). Empty = prompt on first use. Change via the EFx: Change Storage Location command."
 				}
 			}
 		}

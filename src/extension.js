@@ -56,6 +56,7 @@ const fileMap = new Map();
 const pushInProgress = new Set();
 let client = null;
 let bpmClientInst = null;
+let extensionContext = null;
 let treeProvider;
 let bpmTreeProvider;
 let efxLibrariesView = null;
@@ -353,6 +354,7 @@ function formatBOUpdErrors(errors) {
     }).join("\n\n");
 }
 function activate(context) {
+    extensionContext = context;
     treeProvider = new treeProvider_1.EfxTreeProvider(null);
     efxLibrariesView = vscode.window.createTreeView("efxLibraries", { treeDataProvider: treeProvider });
     context.subscriptions.push(efxLibrariesView);
@@ -378,6 +380,14 @@ function activate(context) {
     // -- Switch Company --
     context.subscriptions.push(vscode.commands.registerCommand("efx.switchCompany", async () => {
         await switchActiveCompany(context);
+    }));
+    // -- Change Storage Location --
+    context.subscriptions.push(vscode.commands.registerCommand("efx.changeStorageLocation", async () => {
+        await vscode.workspace.getConfiguration('efx').update('storageLocation', "", vscode.ConfigurationTarget.Global);
+        const base = await getBaseStorageDir();
+        if (base) {
+            vscode.window.showInformationMessage(`EFx: Storage location changed to ${base}`);
+        }
     }));
     // -- Refresh Libraries --
     context.subscriptions.push(vscode.commands.registerCommand("efx.refreshLibraries", async () => {
@@ -410,8 +420,12 @@ function activate(context) {
                     return;
                 }
                 const { code, usings } = epicorClient_1.EpicorClient.extractCode(funcRow.Body);
-                // Write to a temp .cs file in the workspace.
-                const efxDir = getEfxDir();
+                // Write to the profile-scoped storage folder (not the open workspace).
+                const efxDir = await getEfxDir();
+                if (!efxDir) {
+                    vscode.window.showWarningMessage("EFx: Storage location not set — pull cancelled.");
+                    return;
+                }
                 const libDir = path.join(efxDir, libraryId);
                 fs.mkdirSync(libDir, { recursive: true });
                 const filePath = path.join(libDir, `${functionId}.cs`);
@@ -446,7 +460,11 @@ function activate(context) {
         if (node) {
             libraryId = node.libraryId;
             functionId = node.func.FunctionID;
-            const efxDir = getEfxDir();
+            const efxDir = await getEfxDir();
+            if (!efxDir) {
+                vscode.window.showWarningMessage("EFx: Storage location not set — push cancelled.");
+                return;
+            }
             filePath = path.join(efxDir, libraryId, `${functionId}.cs`);
         }
         else {
@@ -457,7 +475,7 @@ function activate(context) {
                 return;
             }
             filePath = editor.document.uri.fsPath;
-            const mapping = fileMap.get(normalizeFsPath(filePath));
+            const mapping = await resolveMapping(filePath);
             if (!mapping) {
                 vscode.window.showWarningMessage("EFx: This file is not a pulled EFx function");
                 return;
@@ -1505,6 +1523,16 @@ function activate(context) {
         }
     }
 
+    // Recover fileMap entries for files reopened from a previous session —
+    // fileMap is in-memory only, so a fresh VS Code process starts with
+    // nothing pulled until this rehydrates from the file's own metadata.
+    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(async doc => {
+        const filePath = doc.uri.fsPath;
+        if (!filePath.endsWith('.cs') || fileMap.has(normalizeFsPath(filePath))) return;
+        const configuredBase = vscode.workspace.getConfiguration('efx').get('storageLocation');
+        if (!configuredBase || !filePath.startsWith(String(configuredBase))) return;
+        await resolveMapping(filePath);
+    }));
     // Watch open documents for BPM file changes
     context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(e => {
         const filePath = e.document.uri.fsPath;
@@ -1524,7 +1552,7 @@ function activate(context) {
         const normalized = normalizeFsPath(doc.uri.fsPath);
         // Skip if the save was triggered by our own push handler (prevents double-push).
         if (pushInProgress.has(normalized)) return;
-        const mapping = fileMap.get(normalized);
+        const mapping = await resolveMapping(doc.uri.fsPath);
         if (!mapping || mapping.isBpm || !client) return;
         const activeProfile = getActiveProfile();
         if (!activeProfile?.autoPush) return;
@@ -1547,6 +1575,20 @@ function activate(context) {
             const state = efxValidationState.get(filePath);
             if (state?.timer) clearTimeout(state.timer);
             efxValidationState.delete(filePath);
+        }
+        // Auto-clean: remove the local copy once its tab is closed, but only
+        // when there's nothing unsaved — never delete on a dirty/discarded close.
+        if (mapping && !doc.isDirty) {
+            const activeProfile = getActiveProfile();
+            if (activeProfile?.autoClean) {
+                try {
+                    fs.unlinkSync(filePath);
+                    fileMap.delete(normalizeFsPath(filePath));
+                }
+                catch {
+                    // best-effort cleanup
+                }
+            }
         }
     }));
 
@@ -1752,8 +1794,12 @@ function activate(context) {
                             : directive.DirectiveType === 2 ? 'Base'
                                 : `Type${directive.DirectiveType}`;
 
-                    const efxDir = getEfxDir();
-                    const bpmDir = path.join(efxDir, '_BPM', directive.BpMethodCode);
+                    const profileRoot = await getProfileStorageRoot();
+                    if (!profileRoot) {
+                        vscode.window.showWarningMessage('BPM: Storage location not set — pull cancelled.');
+                        return;
+                    }
+                    const bpmDir = path.join(profileRoot, 'BPM', directive.BpMethodCode);
                     fs.mkdirSync(bpmDir, { recursive: true });
 
                     const safeName = directive.Name.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
@@ -1824,9 +1870,13 @@ function activate(context) {
                     : directive.DirectiveType === 2 ? 'Base'
                         : `Type${directive.DirectiveType}`;
             const safeName = directive.Name.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
-            const efxDir = getEfxDir();
-            filePath = path.join(efxDir, '_BPM', directive.BpMethodCode, `${typeLabel}_${safeName}.cs`);
-            mapping = fileMap.get(normalizeFsPath(filePath));
+            const profileRoot = await getProfileStorageRoot();
+            if (!profileRoot) {
+                vscode.window.showWarningMessage('BPM: Storage location not set — push cancelled.');
+                return;
+            }
+            filePath = path.join(profileRoot, 'BPM', directive.BpMethodCode, `${typeLabel}_${safeName}.cs`);
+            mapping = await resolveMapping(filePath);
         } else {
             // Called from command palette / active editor
             const editor = vscode.window.activeTextEditor;
@@ -1835,7 +1885,7 @@ function activate(context) {
                 return;
             }
             filePath = editor.document.uri.fsPath;
-            mapping = fileMap.get(normalizeFsPath(filePath));
+            mapping = await resolveMapping(filePath);
         }
 
         if (!mapping || !mapping.isBpm) {
@@ -2464,6 +2514,17 @@ async function runProfileEditor(context, draft, isNew) {
     if (autoPushPick === undefined) return false;
     draft.autoPush = autoPushPick.value;
 
+    // Step 8: auto-clean local file on close
+    const autoCleanPick = await vscode.window.showQuickPick(
+        [
+            { label: "No — keep the local file after closing", value: false },
+            { label: "Yes — delete the local file when its tab is closed (only if fully saved)", value: true },
+        ],
+        { placeHolder: "Delete the local .cs file automatically when you close it?", ignoreFocusOut: true }
+    );
+    if (autoCleanPick === undefined) return false;
+    draft.autoClean = autoCleanPick.value;
+
     return true;
 }
 
@@ -2745,22 +2806,112 @@ async function applyActiveCompany(context, company) {
     vscode.window.showInformationMessage(`EFx: Active company → ${company}`);
 }
 
-function getEfxDir() {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (workspaceFolders && workspaceFolders.length > 0) {
-        return path.join(workspaceFolders[0].uri.fsPath, ".efx");
+// Resolves (prompting once, if needed) the root folder EFx uses to cache
+// pulled functions/directives. Independent of whatever workspace happens to
+// be open — never silently defaults, always asks the first time.
+async function getBaseStorageDir() {
+    const config = vscode.workspace.getConfiguration('efx');
+    const configured = config.get('storageLocation');
+    if (configured && String(configured).trim()) {
+        return String(configured).trim();
     }
-    // Fallback to home dir.
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
-    return path.join(homeDir, ".efx");
+    const choice = await vscode.window.showQuickPick(
+        [
+            { label: "Use default location (VS Code internal storage)", value: "default" },
+            { label: "Choose a folder...", value: "custom" },
+        ],
+        { placeHolder: "EFx: Where should pulled functions and BPM directives be stored?", ignoreFocusOut: true }
+    );
+    if (!choice) return null;
+    let resolved;
+    if (choice.value === "default") {
+        resolved = path.join(extensionContext.globalStorageUri.fsPath, "EpicorExtension");
+    }
+    else {
+        const picked = await vscode.window.showOpenDialog({
+            canSelectFolders: true,
+            canSelectFiles: false,
+            canSelectMany: false,
+            openLabel: "Select EFx Storage Folder",
+        });
+        if (!picked || picked.length === 0) return null;
+        resolved = path.join(picked[0].fsPath, "EpicorExtension");
+    }
+    fs.mkdirSync(resolved, { recursive: true });
+    await config.update('storageLocation', resolved, vscode.ConfigurationTarget.Global);
+    vscode.window.showInformationMessage(`EFx: Storage location set to ${resolved}`);
+    return resolved;
 }
-function getKineticDir() {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (workspaceFolders && workspaceFolders.length > 0) {
-        return path.join(workspaceFolders[0].uri.fsPath, ".kinetic");
+// <base>/<ProfileName>/ — everything for the active profile lives under here.
+async function getProfileStorageRoot() {
+    const base = await getBaseStorageDir();
+    if (!base) return null;
+    const profileName = getActiveProfileName() || "Default";
+    const safeProfile = profileName.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+    return path.join(base, safeProfile);
+}
+async function getEfxDir() {
+    const root = await getProfileStorageRoot();
+    return root ? path.join(root, "Libraries") : null;
+}
+async function getKineticDir() {
+    const root = await getProfileStorageRoot();
+    return root ? path.join(root, "Kinetic") : null;
+}
+// Reads the metadata header written into pulled .cs files (library/function
+// name, or BPM method/directive/type) so a file can be re-identified later.
+function parseHeaderFields(filePath) {
+    let content;
+    try {
+        content = fs.readFileSync(filePath, 'utf-8');
     }
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
-    return path.join(homeDir, ".kinetic");
+    catch {
+        return {};
+    }
+    const fields = {};
+    for (const line of content.split(/\r?\n/).slice(0, 12)) {
+        const m = line.match(/^\/\/\s*([A-Za-z ]+):\s*(.*)$/);
+        if (m) fields[m[1].trim()] = m[2].trim();
+    }
+    return fields;
+}
+// fileMap is in-memory only, so it starts empty on every VS Code restart.
+// This recovers an entry for a file pulled in a previous session by reading
+// the folder structure (EFx: <Library>/<Function>.cs) or the header comment
+// written at pull time (BPM: Method/DirectiveID/Type).
+async function resolveMapping(filePath) {
+    const normalized = normalizeFsPath(filePath);
+    const existing = fileMap.get(normalized);
+    if (existing) return existing;
+    if (!filePath.endsWith('.cs') || !fs.existsSync(filePath)) return null;
+    const fields = parseHeaderFields(filePath);
+    if (fields['BPM Directive'] && fields['Method'] && fields['DirectiveID']) {
+        if (!bpmClientInst) return null;
+        const bpmMethodCode = fields['Method'];
+        const directiveId = fields['DirectiveID'];
+        const typeMap = { Pre: 1, Post: 3, Base: 2 };
+        const directiveType = typeMap[fields['Type']] ?? parseInt(String(fields['Type']).replace('Type', ''), 10);
+        try {
+            const tableset = await bpmClientInst.getBpmMethod('BO', bpmMethodCode);
+            const method = tableset?.BpMethod?.[0];
+            const args = tableset?.BpArgument || [];
+            const functionDefinition = method ? bpmClient_1.buildFunctionDefinition(method, args) : null;
+            const mapping = { libraryId: '__BPM__', functionId: directiveId, bpmMethodCode, directiveId, directiveType, isBpm: true, functionDefinition };
+            fileMap.set(normalized, mapping);
+            return mapping;
+        }
+        catch {
+            return null;
+        }
+    }
+    if (fields['EFx Function']) {
+        const functionId = path.basename(filePath, '.cs');
+        const libraryId = path.basename(path.dirname(filePath));
+        const mapping = { libraryId, functionId };
+        fileMap.set(normalized, mapping);
+        return mapping;
+    }
+    return null;
 }
 async function initClient(context) {
     const profileName = getActiveProfileName();
