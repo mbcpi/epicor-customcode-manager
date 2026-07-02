@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.6.6",
+	"version": "0.6.7",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
