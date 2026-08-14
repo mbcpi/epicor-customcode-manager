@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.6.7",
+	"version": "0.7.0",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -24,6 +24,13 @@
 					"title": "EFx Explorer",
 					"icon": "$(symbol-function)"
 				}
+			],
+			"panel": [
+				{
+					"id": "efx-execute-panel",
+					"title": "EFx Execute",
+					"icon": "$(play)"
+				}
 			]
 		},
 		"views": {
@@ -35,6 +42,13 @@
 				{
 					"id": "bpmMethods",
 					"name": "BPM Methods"
+				}
+			],
+			"efx-execute-panel": [
+				{
+					"id": "efxExecuteView",
+					"name": "Execute",
+					"type": "webview"
 				}
 			]
 		},
@@ -53,7 +67,7 @@
 			},
 			{
 				"command": "efx.configureConnection",
-				"title": "Configure Connection (Manage Profiles)",
+				"title": "Profiles — Switch, Add, Edit",
 				"icon": "$(gear)",
 				"category": "EFx"
 			},
@@ -210,11 +224,6 @@
 				},
 				{
 					"command": "efx.configureConnection",
-					"when": "view == efxLibraries",
-					"group": "navigation"
-				},
-				{
-					"command": "efx.switchProfile",
 					"when": "view == efxLibraries",
 					"group": "navigation"
 				},

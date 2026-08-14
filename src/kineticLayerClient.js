@@ -344,10 +344,21 @@ class KineticMetaFXClient {
     }
 
     // Import an exported layer package onto this client's server.
+    // A non-2xx rejects inside _call, but Epicor can also return 200 with an
+    // error payload — surface that too, so callers never report a false success
+    // for what is a write into another environment.
     async importLayers(exportedContent, overwrite = true) {
-        await this._call("ImportLayers", {
+        const result = await this._call("ImportLayers", {
             fileContent: { content: exportedContent, overwrite },
         });
+        if (result && typeof result === "object") {
+            const errMsg = result.error?.message
+                || result.ErrorMessage
+                || result.returnObj?.ErrorMessage
+                || null;
+            if (errMsg) throw new Error(errMsg);
+        }
+        return result;
     }
 }
 

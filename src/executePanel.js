@@ -33,10 +33,47 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ExecutePanel = void 0;
+exports.ExecuteViewProvider = void 0;
 const vscode = __importStar(require("vscode"));
-class ExecutePanel {
-    constructor(panel, client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging = false) {
+// The execute UI lives as a single reusable WebviewView in the bottom panel
+// (alongside Terminal/Problems/Output). There is exactly one view slot, so
+// executing a different function re-renders it in place rather than opening a
+// new tab. `load()` sets the current function context and reveals the view.
+class ExecuteViewProvider {
+    constructor() {
+        this.view = null;
+        this.loaded = false;
+        this.client = null;
+        this.libraryId = '';
+        this.functionId = '';
+        this.signatures = [];
+        this.companies = [];
+        this.defaultCompany = '';
+        this.treeProvider = null;
+        this.staging = false;
+    }
+    // Called by VS Code when the view becomes visible for the first time (or
+    // again, if it was disposed). Wires up messaging and renders whatever
+    // context we currently hold — or an empty prompt if nothing loaded yet.
+    resolveWebviewView(webviewView) {
+        this.view = webviewView;
+        webviewView.webview.options = { enableScripts: true };
+        webviewView.webview.onDidReceiveMessage(async (msg) => {
+            if (!this.loaded) {
+                return;
+            }
+            if (msg.command === 'execute') {
+                await this.execute(msg.payload, msg.company);
+            }
+            if (msg.command === 'saveSignatures') {
+                await this.saveSignatures(msg.signatures);
+            }
+        });
+        webviewView.onDidDispose(() => { this.view = null; });
+        webviewView.webview.html = this.loaded ? this.getHtml() : this.getEmptyHtml();
+    }
+    // Load a function into the view and reveal it in the bottom panel.
+    async load(client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging = false) {
         this.client = client;
         this.libraryId = libraryId;
         this.functionId = functionId;
@@ -45,45 +82,26 @@ class ExecutePanel {
         this.defaultCompany = defaultCompany || (this.companies[0] || '');
         this.treeProvider = treeProvider || null;
         this.staging = staging;
-        this.disposed = false;
-        this.panel = panel;
-        this.panel.webview.onDidReceiveMessage(async (msg) => {
-            if (msg.command === 'execute') {
-                await this.execute(msg.payload, msg.company);
-            }
-            if (msg.command === 'saveSignatures') {
-                await this.saveSignatures(msg.signatures);
-            }
-        });
-        this.panel.onDidDispose(() => {
-            this.disposed = true;
-            ExecutePanel.panels.delete(`${libraryId}.${functionId}`);
-        });
-        this.panel.webview.html = this.getHtml();
-    }
-    static show(client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging = false) {
-        const key = `${libraryId}.${functionId}`;
-        const existing = ExecutePanel.panels.get(key);
-        if (existing && !existing.disposed) {
-            existing.panel.reveal();
-            return;
+        this.loaded = true;
+        // Focusing the view resolves it if it hasn't been shown yet; if it was
+        // already resolved, resolveWebviewView won't fire again, so re-render.
+        await vscode.commands.executeCommand('efxExecuteView.focus');
+        if (this.view) {
+            this.view.webview.html = this.getHtml();
         }
-        const panel = vscode.window.createWebviewPanel('efxExecute', `▶ ${functionId}`, vscode.ViewColumn.Two, { enableScripts: true, retainContextWhenHidden: true });
-        const ep = new ExecutePanel(panel, client, libraryId, functionId, signatures, companies, defaultCompany, treeProvider, staging);
-        ExecutePanel.panels.set(key, ep);
     }
     async execute(payload, company) {
-        this.panel.webview.postMessage({ command: 'executing' });
+        this.view.webview.postMessage({ command: 'executing' });
         try {
             const result = await this.client.executeFunction(this.libraryId, this.functionId, payload, company || undefined, this.staging);
-            this.panel.webview.postMessage({
+            this.view.webview.postMessage({
                 command: 'result',
                 data: JSON.stringify(result, null, 2),
                 success: true,
             });
         }
         catch (err) {
-            this.panel.webview.postMessage({
+            this.view.webview.postMessage({
                 command: 'result',
                 data: err.message,
                 success: false,
@@ -91,7 +109,7 @@ class ExecutePanel {
         }
     }
     async saveSignatures(newSigs) {
-        this.panel.webview.postMessage({ command: 'sigSaving' });
+        this.view.webview.postMessage({ command: 'sigSaving' });
         try {
             const { saved, diagnostics, updatedSigs } = await this.client.saveSignatures(
                 this.libraryId, this.functionId, newSigs
@@ -100,7 +118,7 @@ class ExecutePanel {
                 const msgs = (diagnostics || []).map(d =>
                     typeof d === 'object' ? (d.Message || JSON.stringify(d)) : String(d)
                 );
-                this.panel.webview.postMessage({
+                this.view.webview.postMessage({
                     command: 'sigError',
                     error: msgs.join('\n') || 'Epicor rejected the signature change',
                 });
@@ -113,13 +131,13 @@ class ExecutePanel {
             if (this.treeProvider) {
                 this.treeProvider.invalidateCache(this.libraryId);
             }
-            this.panel.webview.postMessage({
+            this.view.webview.postMessage({
                 command: 'sigSaved',
                 signatures: updatedSigs,
             });
         }
         catch (err) {
-            this.panel.webview.postMessage({
+            this.view.webview.postMessage({
                 command: 'sigError',
                 error: err.message,
             });
@@ -183,7 +201,29 @@ class ExecutePanel {
         font-size: var(--vscode-font-size);
         color: var(--vscode-foreground);
         background: var(--vscode-editor-background);
-        padding: 16px;
+        padding: 12px 14px;
+    }
+    .main-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 14px;
+        align-items: start;
+    }
+    .left-col { min-width: 0; }
+    .right-col {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        min-width: 0;
+    }
+    .panel-box {
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 6px;
+        padding: 10px 12px;
+    }
+    /* Stack into one column when the panel is too narrow for two. */
+    @media (max-width: 720px) {
+        .main-grid { grid-template-columns: 1fr; }
     }
     h2 {
         font-size: 14px;
@@ -260,7 +300,7 @@ class ExecutePanel {
     }
     textarea {
         width: 100%;
-        min-height: 200px;
+        min-height: 110px;
         background: var(--vscode-input-background);
         color: var(--vscode-input-foreground);
         border: 1px solid var(--vscode-input-border);
@@ -303,7 +343,7 @@ class ExecutePanel {
         word-break: break-word;
         font-family: var(--vscode-editor-font-family);
         font-size: var(--vscode-editor-font-size);
-        max-height: 400px;
+        max-height: 260px;
         overflow-y: auto;
     }
     .error { color: var(--vscode-errorForeground); }
@@ -369,8 +409,10 @@ class ExecutePanel {
     .btn-copy:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.1)); }
     .btn-copy.copied { color: var(--vscode-testing-iconPassed); border-color: var(--vscode-testing-iconPassed); }
     .dataset-table-wrap {
-        margin-top: 10px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; overflow: hidden;
+        margin-top: 8px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; overflow: hidden;
     }
+    .grid-box .dataset-table-wrap { margin-top: 8px; }
+    .grid-box .dataset-empty { margin-top: 8px; padding: 8px 2px; }
     .dataset-tabs {
         display: flex; background: var(--vscode-sideBarSectionHeader-background, rgba(255,255,255,0.04));
         border-bottom: 1px solid var(--vscode-panel-border); flex-wrap: wrap;
@@ -406,46 +448,60 @@ class ExecutePanel {
         ${this.staging ? '<span class="staging-badge">staging</span>' : ''}
     </div>
 
-    ${companyRow}
+    <div class="main-grid">
+        <div class="left-col">
+            ${companyRow}
 
-    <div class="sig-editor" id="sigEditor">
-        <div class="sig-tabs">
-            <button class="sig-tab active" id="tabReq"  onclick="switchTab('request')">Request Params</button>
-            <button class="sig-tab"        id="tabResp" onclick="switchTab('response')">Response Params</button>
-        </div>
-        <div class="sig-col-headers"><span>Argument Name</span><span>Data Type</span><span>Optional</span><span></span></div>
-        <div class="sig-rows" id="sigRows"></div>
-        <div class="sig-footer">
-            <input  id="newArgName"    placeholder="ArgumentName" />
-            <select id="newDataType">${typeOptionsHtml}</select>
-            <input  id="newCustomType" placeholder="Full .NET type name" />
-            <button class="add-btn" onclick="addSigRow()">＋ Add</button>
-        </div>
-        <div class="sig-save-bar">
-            <span class="sig-status" id="sigStatus"></span>
-            <button class="btn-save" id="saveBtn" onclick="saveSignatures()">💾 Save to Epicor</button>
-        </div>
-    </div>
+            <div class="sig-editor" id="sigEditor">
+                <div class="sig-tabs">
+                    <button class="sig-tab active" id="tabReq"  onclick="switchTab('request')">Request Params</button>
+                    <button class="sig-tab"        id="tabResp" onclick="switchTab('response')">Response Params</button>
+                </div>
+                <div class="sig-col-headers"><span>Argument Name</span><span>Data Type</span><span>Optional</span><span></span></div>
+                <div class="sig-rows" id="sigRows"></div>
+                <div class="sig-footer">
+                    <input  id="newArgName"    placeholder="ArgumentName" />
+                    <select id="newDataType">${typeOptionsHtml}</select>
+                    <input  id="newCustomType" placeholder="Full .NET type name" />
+                    <button class="add-btn" onclick="addSigRow()">＋ Add</button>
+                </div>
+                <div class="sig-save-bar">
+                    <span class="sig-status" id="sigStatus"></span>
+                    <button class="btn-save" id="saveBtn" onclick="saveSignatures()">💾 Save to Epicor</button>
+                </div>
+            </div>
 
-    <div class="section">
-        <h2>Request Parameters</h2>
-        <div class="params">${requestInfo}</div>
-        <textarea id="payload" spellcheck="false">${JSON.stringify(defaultPayload, null, 2)}</textarea>
-    </div>
+            <div class="section">
+                <h2>Request Parameters</h2>
+                <div class="params">${requestInfo}</div>
+                <textarea id="payload" spellcheck="false">${JSON.stringify(defaultPayload, null, 2)}</textarea>
+            </div>
 
-    <button id="executeBtn" onclick="doExecute()">
-        Execute
-    </button>
-    <span class="spinner" id="spinner">⏳ Running...</span>
+            ${responseInfo ? `<div class="section">
+                <h2>Response Parameters</h2>
+                <div class="params">${responseInfo}</div>
+            </div>` : ''}
 
-    <div class="response-area">
-        <div class="response-header">
-            <h2>Response</h2>
-            <button class="btn-copy" id="copyBtn" onclick="copyResponse()" title="Copy response to clipboard">⎘ Copy</button>
+            <button id="executeBtn" onclick="doExecute()">
+                Execute
+            </button>
+            <span class="spinner" id="spinner">⏳ Running...</span>
         </div>
-        <div class="params">${responseInfo}</div>
-        <pre id="response">— No response yet —</pre>
-        <div id="datasetWrap" class="dataset-table-wrap" style="display:none"></div>
+
+        <div class="right-col">
+            <div class="panel-box response-box">
+                <div class="response-header">
+                    <h2>Response Object</h2>
+                    <button class="btn-copy" id="copyBtn" onclick="copyResponse()" title="Copy response to clipboard">⎘ Copy</button>
+                </div>
+                <pre id="response">— No response yet —</pre>
+            </div>
+            <div class="panel-box grid-box">
+                <h2>Rendered Grid</h2>
+                <div id="datasetWrap" class="dataset-table-wrap" style="display:none"></div>
+                <div id="datasetEmpty" class="dataset-empty">— Run a function that returns tabular data —</div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -580,13 +636,19 @@ class ExecutePanel {
             return tables;
         }
 
+        // Toggle the rendered-grid area vs. its empty placeholder.
+        function setGridVisible(show) {
+            document.getElementById('datasetWrap').style.display = show ? '' : 'none';
+            document.getElementById('datasetEmpty').style.display = show ? 'none' : '';
+        }
+
         let activeDatasetTab = null;
         function renderDatasetTables(obj) {
             const wrap = document.getElementById('datasetWrap');
             const tables = extractTables(obj);
             const keys = Object.keys(tables);
-            if (keys.length === 0) { wrap.style.display = 'none'; return; }
-            wrap.style.display = '';
+            if (keys.length === 0) { setGridVisible(false); return; }
+            setGridVisible(true);
             activeDatasetTab = activeDatasetTab && tables[activeDatasetTab] ? activeDatasetTab : keys[0];
 
             const tabHtml = keys.map(k =>
@@ -650,7 +712,7 @@ class ExecutePanel {
                 spinner.className = 'spinner active';
                 response.textContent = '⏳ Executing...';
                 response.className = '';
-                datasetWrap.style.display = 'none';
+                setGridVisible(false);
             }
             if (msg.command === 'result') {
                 btn.disabled = false;
@@ -665,13 +727,13 @@ class ExecutePanel {
                         if (looksLikeDataSet(parsed)) {
                             renderDatasetTables(parsed);
                         } else {
-                            datasetWrap.style.display = 'none';
+                            setGridVisible(false);
                         }
                     } catch(e) {
-                        datasetWrap.style.display = 'none';
+                        setGridVisible(false);
                     }
                 } else {
-                    datasetWrap.style.display = 'none';
+                    setGridVisible(false);
                 }
             }
             if (msg.command === 'sigSaving') {
@@ -693,7 +755,37 @@ class ExecutePanel {
 </body>
 </html>`;
     }
+    getEmptyHtml() {
+        return /*html*/ `<!DOCTYPE html>
+<html>
+<head>
+<style>
+    body {
+        font-family: var(--vscode-font-family);
+        font-size: var(--vscode-font-size);
+        color: var(--vscode-descriptionForeground);
+        background: var(--vscode-editor-background);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        margin: 0;
+        text-align: center;
+        padding: 16px;
+    }
+    .hint { max-width: 340px; line-height: 1.5; }
+    .hint .cta { color: var(--vscode-foreground); font-weight: 600; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+    <div class="hint">
+        <div class="cta">No function loaded</div>
+        Right-click a function in the EFx Libraries tree and choose
+        <em>Execute Function</em> to run it here.
+    </div>
+</body>
+</html>`;
+    }
 }
-exports.ExecutePanel = ExecutePanel;
-ExecutePanel.panels = new Map();
+exports.ExecuteViewProvider = ExecuteViewProvider;
 //# sourceMappingURL=executePanel.js.map

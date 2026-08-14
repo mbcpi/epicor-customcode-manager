@@ -61,6 +61,7 @@ let treeProvider;
 let bpmTreeProvider;
 let efxLibrariesView = null;
 let bpmMethodsView = null;
+let executeViewProvider = null;
 function normalizeFsPath(filePath) {
     return String(filePath || "").toLowerCase();
 }
@@ -361,6 +362,11 @@ function activate(context) {
     bpmTreeProvider = new bpmTreeProvider_1.BpmTreeProvider(null);
     bpmMethodsView = vscode.window.createTreeView("bpmMethods", { treeDataProvider: bpmTreeProvider });
     context.subscriptions.push(bpmMethodsView);
+    // Execute UI — a single reusable webview view hosted in the bottom panel.
+    executeViewProvider = new executePanel_1.ExecuteViewProvider();
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider("efxExecuteView", executeViewProvider, {
+        webviewOptions: { retainContextWhenHidden: true },
+    }));
     // Try to initialize client from settings + secrets.
     initClient(context).then(() => updateViewDescriptions());
     // ── Auto-update: check GitHub releases on startup + manual command ──
@@ -681,7 +687,7 @@ function activate(context) {
         // Determine if this library is unpromoted (staging) so execute uses the right URL
         const libMeta = (treeProvider.libraries || []).find(l => l.LibraryID === node.libraryId);
         const staging = libMeta ? !libMeta.Published : false;
-        executePanel_1.ExecutePanel.show(client, node.libraryId, node.func.FunctionID, node.signatures, companies, defaultCompany, treeProvider, staging);
+        await executeViewProvider.load(client, node.libraryId, node.func.FunctionID, node.signatures, companies, defaultCompany, treeProvider, staging);
     }));
     // -- Demote Library --
     context.subscriptions.push(vscode.commands.registerCommand("efx.demoteLibrary", async (node) => {
