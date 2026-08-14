@@ -234,8 +234,6 @@ class ComparePanel {
         this.panel   = panel;
         this.context = context;
         this.disposed = false;
-        // Cache of layer file content for openNativeDiff: key = `${appId}::${fileName}`
-        this._layerCache = new Map();
 
         panel.webview.onDidReceiveMessage(async (msg) => {
             try {
@@ -247,7 +245,7 @@ class ComparePanel {
                     case 'fetchLayerList':    await this._fetchLayerList(msg); break;
                     case 'fetchLayerContent': await this._fetchLayerContent(msg); break;
                     case 'openNativeDiff':    await this._openNativeDiff(msg); break;
-                    case 'applyLayer':        await this._applyLayer(msg); break;
+                    case 'applyFunction':     await this._applyFunction(msg); break;
                 }
             } catch (err) {
                 this._post({ command: 'error', message: err.message });
@@ -278,6 +276,11 @@ class ComparePanel {
     async _secrets(profileName) {
         const password = (await this.context.secrets.get(`efx.profile.${profileName}.password`)) || '';
         const apiKey   = (await this.context.secrets.get(`efx.profile.${profileName}.apiKey`))   || '';
+        // Fail loudly rather than building a client with an empty password and
+        // surfacing a raw auth error later (matches pickKineticEnv elsewhere).
+        if (!password) {
+            throw new Error(`No password stored for profile "${profileName}" — open Manage Profiles and re-enter it.`);
+        }
         return { password, apiKey };
     }
 
@@ -299,9 +302,9 @@ class ComparePanel {
 
     async _runFunctionsCompare({ profileA, companyA, profileB, companyB }) {
         this._post({ command: 'status', text: 'Building clients…' });
-        // New compare run — drop layer content cached from the previous run
-        // (the webview clears its own caches; this one grew unbounded).
-        this._layerCache.clear();
+        // Tell the webview to clear stale results now, so a re-run doesn't keep
+        // showing the previous comparison while this one is still fetching.
+        this._post({ command: 'compareStarted' });
         try {
             const [cA, cB] = await Promise.all([this._efxClient(profileA, companyA), this._efxClient(profileB, companyB)]);
             this._post({ command: 'status', text: 'Fetching library lists…' });
@@ -313,6 +316,15 @@ class ComparePanel {
                 cB.request(cB.getDesignerUrl('GetLibraries'), { libraryIds: allIds }),
             ]);
             this._post({ command: 'status', text: 'Computing diff…' });
+            // request() hands back the raw string when a 2xx body isn't JSON.
+            // Feeding that to buildFnMap yields empty maps, which would render
+            // as "every library is only in the other environment" — a silently
+            // wrong diff. Treat a non-object response as the failure it is.
+            for (const [raw, label] of [[rawA, profileA], [rawB, profileB]]) {
+                if (!raw || typeof raw !== 'object') {
+                    throw new Error(`Unexpected GetLibraries response from ${label} — expected JSON, got ${typeof raw}.`);
+                }
+            }
             const rA = rawA.returnObj || rawA, rB = rawB.returnObj || rawB;
             const { fnMap: fnMapA, refMap: refMapA, libDetail: ldA } = buildFnMap(rA);
             const { fnMap: fnMapB, refMap: refMapB, libDetail: ldB } = buildFnMap(rB);
@@ -444,17 +456,29 @@ class ComparePanel {
             const descA = layerA?.LayerDescription || layerA?.LayerName;
             const descB = layerB?.LayerDescription || layerB?.LayerName;
             console.log(`[comparePanel] _fetchLayerContent appId="${appId}" layerKey="${layerKey}" descA="${descA}" descB="${descB}"`);
-            const [rawA, rawB] = await Promise.all([
-                descA ? cA.getAppForLayer(appId, descA).catch(e => { console.error('[comparePanel] getAppForLayer A failed:', e.message); return null; }) : Promise.resolve(null),
-                descB ? cB.getAppForLayer(appId, descB).catch(e => { console.error('[comparePanel] getAppForLayer B failed:', e.message); return null; }) : Promise.resolve(null),
+            // Track fetch failures separately from "this side has no layer" —
+            // conflating them made two failed fetches normalize to '' === '' and
+            // render as "✓ Identical", i.e. a silent false match.
+            const fetchSide = (client, desc, tag) => desc
+                ? client.getAppForLayer(appId, desc)
+                    .then(raw => ({ raw }))
+                    .catch(e => { console.error(`[comparePanel] getAppForLayer ${tag} failed:`, e.message); return { raw: null, error: e.message }; })
+                : Promise.resolve({ raw: null });
+            const [resA, resB] = await Promise.all([
+                fetchSide(cA, descA, 'A'),
+                fetchSide(cB, descB, 'B'),
             ]);
-            console.log(`[comparePanel] rawA keys:`, rawA ? Object.keys(rawA) : 'null');
-            console.log(`[comparePanel] rawB keys:`, rawB ? Object.keys(rawB) : 'null');
+            if (resA.error && resB.error) {
+                throw new Error(`Could not load layer content from either environment — ${resA.error} / ${resB.error}`);
+            }
+            if (resA.error || resB.error) {
+                this._post({ command: 'layerContentError', appId, layerKey,
+                    message: `${resA.error ? profileA : profileB} failed: ${resA.error || resB.error}` });
+                return;
+            }
             const toStr = v => (v ? JSON.stringify(v, null, 2) : '');
-            const normA = normalizeJson(toStr(rawA));
-            const normB = normalizeJson(toStr(rawB));
-            this._layerCache.set(`${appId}::${layerKey}::a`, normA);
-            this._layerCache.set(`${appId}::${layerKey}::b`, normB);
+            const normA = normalizeJson(toStr(resA.raw));
+            const normB = normalizeJson(toStr(resB.raw));
             this._post({ command: 'layerContentReady', appId, layerKey, normA, normB, same: normA === normB });
         } catch (err) {
             console.error(`[comparePanel] _fetchLayerContent error:`, err.message);
@@ -462,58 +486,139 @@ class ComparePanel {
         }
     }
 
-    // layer = specific layer descriptor from getLayers; if omitted, exports all layers for the app
-    async _applyLayer({ appId, direction, profileA, companyA, profileB, companyB, layer, layerKey }) {
+    // Copy one function's Code+Usings from one environment to the other, reusing
+    // the same wrapper call efx.pushFunction uses — including its read-back
+    // verification. Only handles functions that already exist on both sides:
+    // the wrapper updates rows, it does not create them.
+    async _applyFunction({ libraryId, functionId, direction, profileA, companyA, profileB, companyB }) {
         const srcProfile = direction === 'aToB' ? profileA : profileB;
         const srcCompany = direction === 'aToB' ? companyA : companyB;
         const tgtProfile = direction === 'aToB' ? profileB : profileA;
         const tgtCompany = direction === 'aToB' ? companyB : companyA;
-        const srcLabel   = direction === 'aToB' ? profileA : profileB;
-        const tgtLabel   = direction === 'aToB' ? profileB : profileA;
-        const name       = layerKey || layer?.LayerDescription || layer?.LayerName || appId;
+        const key = `${libraryId}.${functionId}`;
 
         const confirm = await vscode.window.showWarningMessage(
-            `Apply "${name}" from ${srcLabel} → ${tgtLabel}?`,
+            `Apply ${key} from ${srcProfile} → ${tgtProfile}?`,
             { modal: true }, 'Apply'
         );
-        if (confirm !== 'Apply') { this._post({ command: 'applyLayerCancelled', appId, layerKey }); return; }
+        if (confirm !== 'Apply') { this._post({ command: 'applyFnCancelled', libraryId, functionId }); return; }
 
-        this._post({ command: 'applyLayerStarted', appId, layerKey });
+        this._post({ command: 'applyFnStarted', libraryId, functionId });
+        let demoted = false;
+        let tgtClient = null;
         try {
-            const [srcClient, tgtClient] = await Promise.all([
-                this._metafxClient(srcProfile, srcCompany),
-                this._metafxClient(tgtProfile, tgtCompany),
+            const [sc, tc] = await Promise.all([
+                this._efxClient(srcProfile, srcCompany),
+                this._efxClient(tgtProfile, tgtCompany),
             ]);
-            let layersToExport;
-            if (layer) {
-                layersToExport = [layer];
-            } else {
-                this._post({ command: 'applyLayerStatus', appId, layerKey, text: `Getting layers from ${srcLabel}…` });
-                layersToExport = await srcClient.getLayers(appId);
-                if (!layersToExport.length) throw new Error(`No layers found for "${appId}" on ${srcLabel}`);
+            tgtClient = tc;
+
+            // Re-read the source from the server rather than trusting the copy
+            // the webview is holding — the compare may be minutes old.
+            this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Reading ${key} from ${srcProfile}…` });
+            const srcTableset = await sc.getLibrary(libraryId);
+            const srcFunc = srcTableset?.EfxFunction?.find(f => f.FunctionID === functionId);
+            if (!srcFunc) throw new Error(`${key} not found on ${srcProfile}`);
+            const { code, usings } = EpicorClient.extractCode(srcFunc.Body);
+
+            this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Checking ${tgtProfile}…` });
+            const tgtTableset = await tgtClient.getLibrary(libraryId);
+            const tgtLibRow = tgtTableset?.EfxLibrary?.[0];
+            if (!tgtLibRow) throw new Error(`Library ${libraryId} does not exist on ${tgtProfile} — create it there first.`);
+            if (!tgtTableset.EfxFunction?.some(f => f.FunctionID === functionId)) {
+                throw new Error(`${key} does not exist on ${tgtProfile} — this applies changes to existing functions, it cannot create new ones.`);
             }
-            this._post({ command: 'applyLayerStatus', appId, layerKey, text: `Exporting from ${srcLabel}…` });
-            const exported = await srcClient.exportLayers(layersToExport);
-            if (!exported) throw new Error(`Export returned empty for "${name}"`);
 
-            this._post({ command: 'applyLayerStatus', appId, layerKey, text: `Importing to ${tgtLabel}…` });
-            await tgtClient.importLayers(exported, true);
+            // Frozen blocks the write. Promoted libraries are frozen and can be
+            // demoted; a library frozen for any other reason cannot be helped here.
+            if (tgtLibRow.Frozen === true) {
+                if (!tgtLibRow.Published) {
+                    throw new Error(`${libraryId} is locked/frozen on ${tgtProfile}. Unfreeze it in Epicor first.`);
+                }
+                const ok = await vscode.window.showWarningMessage(
+                    `${libraryId} is promoted to production on ${tgtProfile}. Demote it, apply ${functionId}, then re-promote?`,
+                    { modal: true }, 'Demote, Apply, Re-promote'
+                );
+                if (ok !== 'Demote, Apply, Re-promote') { this._post({ command: 'applyFnCancelled', libraryId, functionId }); return; }
+                this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Demoting ${libraryId} on ${tgtProfile}…` });
+                await tgtClient.demoteFromProduction(libraryId);
+                demoted = true;
+            }
 
-            this._post({ command: 'applyLayerDone', appId, layerKey });
-            vscode.window.showInformationMessage(`✓ Applied "${name}" to ${tgtLabel}`);
+            this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Applying to ${tgtProfile}…` });
+            const result = await tgtClient.validateFunctionViaWrapper(
+                libraryId, functionId, code, usings, 'Utilities', 'ApplyChangesWithDiagnostics');
+            if (!result.saved) {
+                const diags = (result.diagnostics || result.errors || [])
+                    .map(d => (typeof d === 'object' && d !== null) ? [d.Code, d.Message].filter(Boolean).join(': ') : String(d));
+                throw new Error(diags[0] || result.outMsg || result.outResult || 'Apply rejected by Epicor');
+            }
+
+            // Read back and compare, same as pushFunction does.
+            this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Verifying on ${tgtProfile}…` });
+            const verifyTableset = await tgtClient.getLibrary(libraryId);
+            const verifyFunc = verifyTableset?.EfxFunction?.find(f => f.FunctionID === functionId);
+            if (!verifyFunc) throw new Error(`Verification failed: ${key} not found on ${tgtProfile} after apply.`);
+            const verifyCode = EpicorClient.extractCode(verifyFunc.Body).code;
+            const norm = s => String(s || '').replace(/\r\n/g, '\n').trimEnd();
+            if (norm(verifyCode) !== norm(code)) {
+                throw new Error(`Apply reported success, but ${tgtProfile} code does not match ${srcProfile}.`);
+            }
+
+            // Signatures ride a different endpoint, so a code apply can leave
+            // them out of sync — say so rather than implying a full match.
+            const sigOf = ts => JSON.stringify((ts?.EfxFunctionSignature || [])
+                .filter(s => s.FunctionID === functionId)
+                .map(s => [s.ArgumentName, s.DataType, !!s.Response, !!s.Optional])
+                .sort());
+            const sigsDiffer = sigOf(srcTableset) !== sigOf(verifyTableset);
+
+            this._post({ command: 'applyFnDone', libraryId, functionId });
+            if (sigsDiffer) {
+                vscode.window.showWarningMessage(
+                    `✓ Applied ${key} to ${tgtProfile} — but signatures still differ. Code only; edit parameters via Execute → Edit Signatures.`);
+            } else {
+                vscode.window.showInformationMessage(`✓ Verified ${key} on ${tgtProfile} — code matches ${srcProfile}`);
+            }
         } catch (err) {
-            this._post({ command: 'applyLayerError', appId, layerKey, message: err.message });
+            this._post({ command: 'applyFnError', libraryId, functionId, message: err.message });
+        } finally {
+            // Always restore promotion, including when the apply above threw —
+            // otherwise a failed run leaves a production library demoted.
+            if (demoted && tgtClient) {
+                try {
+                    this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Re-promoting ${libraryId}…` });
+                    await tgtClient.promoteToProduction(libraryId);
+                    this._post({ command: 'applyFnStatus', libraryId, functionId, text: '' });
+                } catch (e) {
+                    vscode.window.showErrorMessage(
+                        `⚠ ${libraryId} on ${tgtProfile} could NOT be re-promoted and is still demoted — promote it manually. (${e.message})`);
+                }
+            }
         }
     }
 
-    async _openNativeDiff({ appId, fileName, labelA, labelB, contentA, contentB }) {
-        const os = require('os'), path = require('path'), fs = require('fs');
-        // Content may be passed directly (functions, BPMs) or retrieved from layer cache
-        const normA = contentA !== undefined ? contentA : (this._layerCache.get(`${appId}::${fileName}::a`) || '');
-        const normB = contentB !== undefined ? contentB : (this._layerCache.get(`${appId}::${fileName}::b`) || '');
+    async _openNativeDiff({ diffId, fileName, labelA, labelB, contentA, contentB }) {
+        const os = require('os'), path = require('path'), fs = require('fs'), crypto = require('crypto');
+        const normA = contentA || '';
+        const normB = contentB || '';
         const safeName = (fileName || 'diff').replace(/[^a-zA-Z0-9._-]/g, '_');
-        const pathA = path.join(os.tmpdir(), `efx_cmp_a_${safeName}`);
-        const pathB = path.join(os.tmpdir(), `efx_cmp_b_${safeName}`);
+        // Scope every diff to its own directory pair. Keying temp paths on the
+        // bare filename let same-named items under different parents (two
+        // libraries each with a GetData function, two apps each with a Base
+        // layer) share a path — reopening one silently rewrote the other's
+        // still-open diff tab. Keeping the real filename preserves syntax
+        // highlighting; the side folder is named for the environment.
+        const scope = crypto.createHash('sha1')
+            .update(`${diffId || ''}::${fileName || ''}`).digest('hex').slice(0, 12);
+        const sideDir = (label, fallback) => {
+            const safeLabel = String(label || '').replace(/[^a-zA-Z0-9._-]/g, '_') || fallback;
+            const dir = path.join(os.tmpdir(), 'efx-compare', scope, safeLabel);
+            fs.mkdirSync(dir, { recursive: true });
+            return dir;
+        };
+        const pathA = path.join(sideDir(labelA, 'A'), safeName);
+        const pathB = path.join(sideDir(labelB, 'B'), safeName);
         fs.writeFileSync(pathA, normA, 'utf8');
         fs.writeFileSync(pathB, normB, 'utf8');
         const title = `${fileName}: ${labelA || 'A'} ↔ ${labelB || 'B'}`;
@@ -925,6 +1030,9 @@ let BPM_FILTER= 'all', BPM_SEL= null;
 let LY_FILTER = 'all', LY_SEL = null;
 let ACTIVE_TAB= 'functions';
 let BPM_LOADED = false, LY_LOADED = false;
+// Separate in-flight flags: the LOADED flags only flip on success, so without
+// these a double-click fired two concurrent full fetches.
+let BPM_LOADING = false, LY_LOADING = false;
 let LAST_RUN   = null; // {profileA, companyA, profileB, companyB}
 let LAYER_LIST_CACHE    = {}; // appId -> { layersA, layersB }
 let LAYER_CONTENT_CACHE = {}; // appId::layerKey -> { normA, normB, same } | { loading } | { error }
@@ -933,6 +1041,14 @@ let PENDING_DIFF        = null; // { appId, layerKey } -- open native diff once 
 
 // ── HELPERS ───────────────────────────────────────────────────────────
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+// For values interpolated into a JS string literal inside an on* attribute.
+// esc() alone is not enough there: it leaves ' untouched, so a layer or
+// function named "Bob's Layer" closed the literal early and killed the handler
+// (or worse, injected). Backslash-escape for the JS layer first, then HTML-escape
+// for the attribute layer — the browser undoes them in the reverse order.
+function jsAttr(s){
+  return esc(String(s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\r?\\n/g,'\\\\n'));
+}
 // Only treat genuinely blob-like strings as binary. The old 20-char threshold
 // misclassified ordinary alphanumeric layer names (e.g. "CustomerPortalLayerV2"),
 // collapsing every such layer onto its TypeCode key and silently dropping rows.
@@ -960,7 +1076,21 @@ function isBlankLayer(l) {
 }
 function layerEntries(layers) {
   const used = new Map();
-  return (layers || []).filter(l => !isBlankLayer(l)).map(l => {
+  // Suffix assignment must not depend on the order the server happened to
+  // return rows in. If env A returned [published, wip] and env B returned
+  // [wip, published], "#2" landed on a different logical layer per side and
+  // the two environments got paired against the wrong counterparts. Sorting on
+  // a stable discriminator first makes both sides number duplicates the same.
+  // (filter() already copied, so this sort does not disturb the cached array.)
+  const rows = (layers || []).filter(l => !isBlankLayer(l));
+  rows.sort((x, y) =>
+    layerBaseName(x).localeCompare(layerBaseName(y))
+    || String(x.Company || '').localeCompare(String(y.Company || ''))
+    || String(x.DeviceType || '').localeCompare(String(y.DeviceType || ''))
+    || String(x.LayerDescription || '').localeCompare(String(y.LayerDescription || ''))
+    || String(x.TypeCode || '').localeCompare(String(y.TypeCode || ''))
+    || (x.IsPublished === y.IsPublished ? 0 : x.IsPublished ? -1 : 1));
+  return rows.map(l => {
     let key = [layerBaseName(l), l.Company || '', l.DeviceType || ''].filter(Boolean).join(' · ');
     const n = used.get(key) || 0;
     used.set(key, n + 1);
@@ -1032,6 +1162,7 @@ function runCompare() {
   }
   LAST_RUN = { profileA, companyA, profileB, companyB };
   BPM_LOADED = false; LY_LOADED = false;
+  BPM_LOADING = false; LY_LOADING = false;
   LAYER_LIST_CACHE = {}; LAYER_CONTENT_CACHE = {}; LAYER_OBJECTS = {}; PENDING_DIFF = null;
   // Reset BPM + layers back to load-prompt
   document.getElementById('bpmPrompt').style.display = '';
@@ -1045,7 +1176,8 @@ function runCompare() {
 
 function loadBpm() {
   if (!LAST_RUN) { setStatus('⚠ Run a compare first'); return; }
-  if (BPM_LOADED) return;
+  if (BPM_LOADED || BPM_LOADING) return;
+  BPM_LOADING = true;
   document.getElementById('bpmPrompt').style.display = 'none';
   document.getElementById('bpmMain').style.display   = 'flex';
   document.getElementById('bpmDetail').innerHTML     = '<div class="empty-state"><span>Loading BPM data…</span></div>';
@@ -1055,7 +1187,8 @@ function loadBpm() {
 
 function loadLayers() {
   if (!LAST_RUN) { setStatus('⚠ Run a compare first'); return; }
-  if (LY_LOADED) return;
+  if (LY_LOADED || LY_LOADING) return;
+  LY_LOADING = true;
   document.getElementById('layersPrompt').style.display = 'none';
   document.getElementById('layersMain').style.display   = 'flex';
   document.getElementById('layersDetail').innerHTML     = '<div class="empty-state"><span>Loading app list…</span></div>';
@@ -1088,14 +1221,14 @@ window.addEventListener('message', ({ data: msg }) => {
       renderFnSummary(); fnApply();
       break;
     case 'bpmReady':
-      BPM_LOADED = true;
+      BPM_LOADED = true; BPM_LOADING = false;
       setStatus('');
       BPM_DATA = msg.data;
       document.getElementById('bpmBadge').textContent = BPM_DATA.total;
       renderBpmSummary(); bpmApply();
       break;
     case 'layersReady':
-      LY_LOADED = true;
+      LY_LOADED = true; LY_LOADING = false;
       setStatus('');
       LY_DATA = msg.data;
       document.getElementById('layersBadge').textContent = LY_DATA.total;
@@ -1132,7 +1265,7 @@ window.addEventListener('message', ({ data: msg }) => {
       // Auto-open native diff if pending
       if (PENDING_DIFF && PENDING_DIFF.appId === msg.appId && PENDING_DIFF.layerKey === msg.layerKey) {
         PENDING_DIFF = null;
-        sendDiff(msg.normA||'', msg.normB||'', msg.layerKey.replace(/[^a-zA-Z0-9._-]/g,'_')+'.json', LAST_RUN?.profileA, LAST_RUN?.profileB);
+        sendDiff(msg.normA||'', msg.normB||'', msg.layerKey.replace(/[^a-zA-Z0-9._-]/g,'_')+'.json', LAST_RUN?.profileA, LAST_RUN?.profileB, msg.appId);
       }
       break;
     }
@@ -1141,30 +1274,37 @@ window.addEventListener('message', ({ data: msg }) => {
       { const bodyEl2 = document.getElementById('lrb_' + safeId(msg.appId + '_' + msg.layerKey));
         if (bodyEl2) bodyEl2.innerHTML = \`<div class="only-info" style="color:var(--c-only-a)">Error: \${esc(msg.message)}</div>\`; }
       break;
-    case 'applyLayerStarted':
-      setStatus(\`Applying "\${msg.layerKey || msg.appId}"…\`);
+    case 'applyFnStarted':
+      setStatus(\`Applying \${msg.libraryId}.\${msg.functionId}…\`);
       break;
-    case 'applyLayerStatus':
+    case 'applyFnStatus':
       setStatus(msg.text);
       break;
-    case 'applyLayerDone':
-      setStatus('');
-      // Re-fetch layer list to reflect the change
-      if (LY_SEL === msg.appId) {
-        delete LAYER_LIST_CACHE[msg.appId];
-        if (msg.layerKey) delete LAYER_CONTENT_CACHE[\`\${msg.appId}::\${msg.layerKey}\`];
-        vscode.postMessage({ command: 'fetchLayerList', appId: msg.appId, ...LAST_RUN });
-      }
-      break;
-    case 'applyLayerCancelled':
+    case 'applyFnCancelled':
       setStatus('');
       break;
-    case 'applyLayerError':
-      setStatus('Apply error: ' + msg.message);
+    case 'applyFnDone':
+      setStatus(\`✓ Applied \${msg.functionId} — re-run compare to refresh this view\`);
+      break;
+    case 'applyFnError':
+      setStatus('Apply failed: ' + msg.message);
       break;
     case 'error':
       document.getElementById('runBtn').disabled = false;
       setStatus('Error: ' + msg.message);
+      // Put the failed tab back to its load prompt. Leaving it on a permanent
+      // "Loading…" pane with the retry button hidden meant the only way back
+      // was re-running the whole comparison.
+      if (msg.tab === 'bpm') {
+        BPM_LOADING = false;
+        document.getElementById('bpmPrompt').style.display = '';
+        document.getElementById('bpmMain').style.display   = 'none';
+      }
+      if (msg.tab === 'layers') {
+        LY_LOADING = false;
+        document.getElementById('layersPrompt').style.display = '';
+        document.getElementById('layersMain').style.display   = 'none';
+      }
       break;
   }
 });
@@ -1192,7 +1332,7 @@ function fnApply() {
   document.getElementById('fnList').innerHTML = items.length
     ? items.map(l => {
         const delta = l.fnDiffs.filter(f => f.status !== 'match').length;
-        return \`<div class="list-item s-\${l.status} \${l.libID===FN_SEL?'active':''}" onclick="fnSelect('\${esc(l.libID)}')">
+        return \`<div class="list-item s-\${l.status} \${l.libID===FN_SEL?'active':''}" onclick="fnSelect('\${jsAttr(l.libID)}')">
           <div class="list-dot"></div>
           <span class="list-name" title="\${esc(l.libID)}">\${esc(l.libID)}</span>
           \${delta ? \`<span class="list-delta">\${delta}Δ</span>\` : ''}
@@ -1298,12 +1438,20 @@ function renderFnRow(fn, libID, ea, eb) {
   const sb = { match:'MATCH', diff:'DIFF', 'only-a': ea, 'only-b': eb };
   const changed = fn.fields ? Object.entries(fn.fields).filter(([k,v])=>k!=='hasDiff'&&typeof v==='object'&&!v.same).map(([k])=>k) : [];
   const id = 'fn_' + CSS.escape(libID + '_' + fn.fnID);
+  // Only offer Apply where it can actually work: the wrapper updates an
+  // existing function row, so only-in-one-environment functions are excluded
+  // (they need creating on the target first), as are already-matching ones.
+  const applyBtns = fn.status === 'diff'
+    ? \`<button class="open-diff-btn" title="Copy this function's code to \${esc(eb)}" onclick="event.stopPropagation();applyFn('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}','aToB')">→ \${esc(eb)}</button>\`
+      + \`<button class="open-diff-btn" title="Copy this function's code to \${esc(ea)}" onclick="event.stopPropagation();applyFn('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}','bToA')">→ \${esc(ea)}</button>\`
+    : '';
   return \`<div class="fn-row" id="\${id}">
     <div class="fn-row-hdr" onclick="toggleFn('\${id}')">
       <span class="fn-badge" style="background:\${sc[fn.status]}22;color:\${sc[fn.status]}">\${sb[fn.status]}</span>
       <span class="fn-name">\${esc(fn.fnID)}</span>
       \${changed.length?\`<span class="fn-changed">\${changed.join(', ')}</span>\`:''}
-      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openFnDiff('\${esc(libID)}','\${esc(fn.fnID)}')">↗ Diff</button>
+      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openFnDiff('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}')">↗ Diff</button>
+      \${applyBtns}
       <span class="chevron">▶</span>
     </div>
     <div class="fn-body">\${renderFnBody(fn, ea, eb)}</div>
@@ -1397,7 +1545,7 @@ function bpmApply() {
   const q = (document.getElementById('bpmSearch').value||'').toLowerCase();
   const items = BPM_DATA.services.filter(s => (BPM_FILTER==='all'||s.status===BPM_FILTER)&&(!q||s.businessObject.toLowerCase().includes(q)));
   document.getElementById('bpmList').innerHTML = items.length
-    ? items.map(s => \`<div class="list-item s-\${s.status} \${s.svcKey===BPM_SEL?'active':''}" onclick="bpmSelect('\${esc(s.svcKey)}')">
+    ? items.map(s => \`<div class="list-item s-\${s.status} \${s.svcKey===BPM_SEL?'active':''}" onclick="bpmSelect('\${jsAttr(s.svcKey)}')">
         <div class="list-dot"></div>
         <span class="list-name" title="\${esc(s.svcKey)}">\${esc(s.businessObject)}</span>
         \${s.diffCount?\`<span class="list-delta">\${s.diffCount}Δ</span>\`:''}
@@ -1450,7 +1598,7 @@ function renderBpmDirRow(dir, methodCode, ea, eb) {
       <span class="fn-badge" style="background:\${sc[dir.status]}22;color:\${sc[dir.status]}">\${sb[dir.status]}</span>
       <span class="fn-name">\${esc(dir.name)}\${dirType?\` <span style="opacity:.5;font-size:10px">[\${dirType}]</span>\`:''}</span>
       \${changed.length?\`<span class="fn-changed">\${changed.join(', ')}</span>\`:''}
-      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openBpmDirDiff('\${esc(methodCode)}','\${esc(dir.name)}')">↗ Diff</button>
+      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openBpmDirDiff('\${jsAttr(methodCode)}','\${jsAttr(dir.name)}')">↗ Diff</button>
       <span class="chevron">▶</span>
     </div>
     <div class="fn-body">\${renderBpmDirBody(dir, ea, eb)}</div>
@@ -1517,7 +1665,7 @@ function layersApply() {
     ? items.map(a => {
         const cls = a.status!=='in-both' ? \`s-\${a.status}\` : a.timestampsDiffer ? 's-ts-diff' : 's-in-both';
         const badge = a.status==='only-a'?LAST_RUN.profileA : a.status==='only-b'?LAST_RUN.profileB : a.timestampsDiffer?'⏱ DIFFER':'MATCH';
-        return \`<div class="list-item \${cls} \${a.id===LY_SEL?'active':''}" onclick="layersSelect('\${esc(a.id)}')">
+        return \`<div class="list-item \${cls} \${a.id===LY_SEL?'active':''}" onclick="layersSelect('\${jsAttr(a.id)}')">
           <div class="list-dot"></div>
           <span class="list-name" title="\${esc(a.id)}">\${esc(a.id)}</span>
           \${a.subType?\`<span class="list-delta">\${esc(a.subType)}</span>\`:''}
@@ -1609,21 +1757,14 @@ function renderLayerRow(row, appId, ea, eb) {
     ? '<span style="opacity:.8;font-size:10px;color:var(--c-diff)"> [WIP]</span>' : '';
 
   const diffBtn   = (inA && inB)
-    ? \`<button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openLayerDiff('\${esc(appId)}','\${esc(key)}')">↗ Diff</button>\`
+    ? \`<button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openLayerDiff('\${jsAttr(appId)}','\${jsAttr(key)}')">↗ Diff</button>\`
     : '';
-  const applyAtoB = inA
-    ? \`<button class="open-diff-btn" onclick="event.stopPropagation();applyLayerByKey('\${esc(appId)}','\${esc(key)}','aToB')">→ \${esc(eb)}</button>\`
-    : '';
-  const applyBtoA = inB
-    ? \`<button class="open-diff-btn" onclick="event.stopPropagation();applyLayerByKey('\${esc(appId)}','\${esc(key)}','bToA')">→ \${esc(ea)}</button>\`
-    : '';
-
   return \`<div class="fn-row" id="\${rid}">
-    <div class="fn-row-hdr" onclick="toggleFn('\${rid}');loadLayerContent('\${esc(appId)}','\${esc(key)}')">
+    <div class="fn-row-hdr" onclick="toggleFn('\${rid}');loadLayerContent('\${jsAttr(appId)}','\${jsAttr(key)}')">
       <span class="fn-badge" style="background:\${sc[status]}22;color:\${sc[status]}">\${sb[status]}</span>
       <span class="fn-name">\${esc(key)}\${typeLabel}\${wipLabel}</span>
       \${compLabel}
-      \${diffBtn}\${applyAtoB}\${applyBtoA}
+      \${diffBtn}
       <span class="chevron">▶</span>
     </div>
     <div class="fn-body" id="\${rbid}">\${renderLayerRowBody(\`\${appId}::\${key}\`, inA, inB, ea, eb)}</div>
@@ -1643,7 +1784,11 @@ function renderLayerRowBody(contentKey, inA, inB, ea, eb) {
 
 function loadLayerContent(appId, layerKey) {
   const ck = \`\${appId}::\${layerKey}\`;
-  if (LAYER_CONTENT_CACHE[ck]) return; // already loaded or in-flight
+  const cached = LAYER_CONTENT_CACHE[ck];
+  // Loaded or in-flight → nothing to do. A previous *error* must not latch,
+  // though: it used to make the row permanently unclickable (and left
+  // openLayerDiff's PENDING_DIFF waiting on a fetch that never re-fired).
+  if (cached && !cached.error) return;
   LAYER_CONTENT_CACHE[ck] = { loading: true };
   const layerA = LAYER_OBJECTS[\`\${appId}::\${layerKey}::a\`] || null;
   const layerB = LAYER_OBJECTS[\`\${appId}::\${layerKey}::b\`] || null;
@@ -1653,7 +1798,7 @@ function loadLayerContent(appId, layerKey) {
 function openLayerDiff(appId, layerKey) {
   const c = LAYER_CONTENT_CACHE[\`\${appId}::\${layerKey}\`];
   if (c && !c.loading && !c.error) {
-    sendDiff(c.normA||'', c.normB||'', layerKey.replace(/[^a-zA-Z0-9._-]/g,'_')+'.json', LAST_RUN?.profileA, LAST_RUN?.profileB);
+    sendDiff(c.normA||'', c.normB||'', layerKey.replace(/[^a-zA-Z0-9._-]/g,'_')+'.json', LAST_RUN?.profileA, LAST_RUN?.profileB, appId);
     return;
   }
   PENDING_DIFF = { appId, layerKey };
@@ -1661,23 +1806,22 @@ function openLayerDiff(appId, layerKey) {
   loadLayerContent(appId, layerKey);
 }
 
-function applyLayerByKey(appId, layerKey, direction) {
-  const side  = direction === 'aToB' ? 'a' : 'b';
-  const layer = LAYER_OBJECTS[\`\${appId}::\${layerKey}::\${side}\`] || null;
-  vscode.postMessage({ command: 'applyLayer', appId, layer, layerKey, direction, ...LAST_RUN });
-}
-
 // ── Unified native diff helpers ──────────────────────────────────────────
-function sendDiff(cA, cB, fileName, lA, lB) {
+// diffId scopes the temp files (library / app / BPM method) so two items that
+// share a filename under different parents don't collide on disk.
+function sendDiff(cA, cB, fileName, lA, lB, diffId) {
   vscode.postMessage({ command: 'openNativeDiff',
-    contentA: cA, contentB: cB,
+    contentA: cA, contentB: cB, diffId: diffId || '',
     fileName: fileName, labelA: lA || 'A', labelB: lB || 'B' });
+}
+function applyFn(libraryId, functionId, direction) {
+  vscode.postMessage({ command: 'applyFunction', libraryId, functionId, direction, ...LAST_RUN });
 }
 function openFnDiff(libId, fnId) {
   const lib = (FN_DATA?.libraries||[]).find(l=>l.libID===libId);
   const fn  = (lib?.fnDiffs||[]).find(f=>f.fnID===fnId);
   if (!fn) return;
-  sendDiff(fn.fa?._code||'', fn.fb?._code||'', fnId+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB);
+  sendDiff(fn.fa?._code||'', fn.fb?._code||'', fnId+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB, libId);
 }
 function openBpmDirDiff(methodCode, dirName) {
   for (const svc of (BPM_DATA?.services||[])) {
@@ -1690,18 +1834,13 @@ function openBpmDirDiff(methodCode, dirName) {
       // Widget-only directives have no C# code — diff the XAML instead of
       // opening two empty documents.
       if (!hasCode && d.fields?.Xaml && !d.fields.Xaml.same) {
-        sendDiff(d.fields.Xaml.a||'', d.fields.Xaml.b||'', safe+'.widgets.txt', LAST_RUN?.profileA, LAST_RUN?.profileB);
+        sendDiff(d.fields.Xaml.a||'', d.fields.Xaml.b||'', safe+'.widgets.txt', LAST_RUN?.profileA, LAST_RUN?.profileB, methodCode);
       } else {
-        sendDiff(d.da?._code||'', d.db?._code||'', safe+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB);
+        sendDiff(d.da?._code||'', d.db?._code||'', safe+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB, methodCode);
       }
       return;
     }
   }
-}
-function openLayerDiff_unused(appId, fileName) {
-  // kept for reference only — replaced by openLayerDiff above
-  if (!appId) return;
-  sendDiff(f.normA||'', f.normB||'', fileName, LAST_RUN?.profileA, LAST_RUN?.profileB);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
