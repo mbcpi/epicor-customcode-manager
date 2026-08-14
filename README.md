@@ -34,6 +34,35 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 - **Pull** C# custom code from any directive into a local `.cs` file
 - **Push** edited directive code back to Epicor with live compile diagnostics
 
+### Environment Comparison
+
+Compare two Epicor environments side by side — click **Compare Libraries** in the
+EFx Explorer toolbar, pick a profile and company for each side, and run.
+
+- **Functions** — every library and function across both environments, tagged
+  **Match**, **Different**, or **Only in _\<env\>_**
+  - Drill into any function for **Code**, **Signature**, and **Metadata** tabs,
+    each flagged when it differs
+  - Library-level comparison covers references (tables, services, assemblies,
+    library refs) and settings such as `DirectDBAccess`,
+    `AllowCustomCodeFunctions`, and `Frozen`
+  - **Apply** a function's code from one environment to the other — the result is
+    read back from the server and verified against the source before it reports
+    success
+    - A promoted target library is demoted, updated, and re-promoted for you
+    - Available for functions that exist in both environments; creating a missing
+      function on the target is still a manual step
+    - Code and usings only — signatures are pushed separately, and you're warned
+      when they still differ
+- **BPM** — services, methods, and directives compared on both custom C# code and
+  widget structure
+  - Widget comparison is semantic: real node, condition, and binding changes show
+    up, while designer noise like canvas positions does not
+- **Layers** — Kinetic application layers per app, including layers that exist in
+  only one environment
+- **↗ Diff** on any row opens it in VS Code's native side-by-side diff editor
+- BPM and Layers load on demand, so a functions-only comparison stays fast
+
 ### Multi-Profile / Multi-Company
 
 - Configure multiple Epicor environment profiles (Dev, Pilot, Prod, etc.)
