@@ -47,6 +47,7 @@ const { openWidgetPanel } = require("./bpmWidgetPanel");
 const updater_1 = require("./updater");
 const kineticLayerClient_1 = require("./kineticLayerClient");
 const { ComparePanel } = require("./comparePanel");
+const { openFunctionSearch, clearSearchCache } = require("./searchQuickPick");
 // Store pulled tablesets for push-back/debugging.
 const pulledTablesets = new Map();
 // Map open .cs files back to their library/function.
@@ -401,6 +402,7 @@ function activate(context) {
             vscode.window.showWarningMessage("EFx: Configure connection first");
             return;
         }
+        clearSearchCache();
         await treeProvider.refresh();
     }));
     // -- Pull Function --
@@ -606,6 +608,8 @@ function activate(context) {
                     }
 
                     treeProvider.invalidateCache(libraryId);
+                    // The pushed body is now stale in the find index.
+                    clearSearchCache();
                 }
                 catch (err) {
                     console.error("EFx Push failed:", err);
@@ -2191,6 +2195,14 @@ function activate(context) {
     }));
     context.subscriptions.push(vscode.commands.registerCommand("efx.compareLibraries", () => {
         ComparePanel.show(context);
+    }));
+    // -- Find in Functions (Cmd+F across the whole library) --
+    context.subscriptions.push(vscode.commands.registerCommand("efx.searchFunctions", async () => {
+        await openFunctionSearch(client, {});
+    }));
+    // Same popout, scoped to the right-clicked library.
+    context.subscriptions.push(vscode.commands.registerCommand("efx.searchInLibrary", async (node) => {
+        await openFunctionSearch(client, { libraryId: node?.library?.LibraryID || node?.libraryId });
     }));
 }
 // ─────────────────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.7.0",
+	"version": "0.7.1",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -213,6 +213,26 @@
 				"title": "Compare Libraries",
 				"icon": "$(diff)",
 				"category": "EFx"
+			},
+			{
+				"command": "efx.searchFunctions",
+				"title": "Find in Functions",
+				"icon": "$(search)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.searchInLibrary",
+				"title": "Find in This Library",
+				"icon": "$(search)",
+				"category": "EFx"
+			}
+		],
+		"keybindings": [
+			{
+				"command": "efx.searchFunctions",
+				"key": "ctrl+f",
+				"mac": "cmd+f",
+				"when": "focusedView == efxLibraries"
 			}
 		],
 		"menus": {
@@ -239,6 +259,11 @@
 				},
 				{
 					"command": "efx.compareLibraries",
+					"when": "view == efxLibraries",
+					"group": "navigation"
+				},
+				{
+					"command": "efx.searchFunctions",
 					"when": "view == efxLibraries",
 					"group": "navigation"
 				},
@@ -343,6 +368,11 @@
 					"command": "efx.regenerateLibrary",
 					"when": "view == efxLibraries && (viewItem == library-unpromoted || viewItem == library-promoted)",
 					"group": "navigation@4"
+				},
+				{
+					"command": "efx.searchInLibrary",
+					"when": "view == efxLibraries && (viewItem == library-unpromoted || viewItem == library-promoted || viewItem == function-group)",
+					"group": "navigation@5"
 				}
 			],
 			"commandPalette": [
@@ -356,6 +386,10 @@
 				},
 				{
 					"command": "efx.setTableUpdatable",
+					"when": "false"
+				},
+				{
+					"command": "efx.searchInLibrary",
 					"when": "false"
 				}
 			]
@@ -419,7 +453,7 @@
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
 		"compile": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
-		"deploy": "npm run compile && cp out/extension.js /Users/micahbragg-cpi/.antigravity/extensions/micah-bragg.epicor-efx-manager-0.5.0/out/extension.js",
+		"deploy": "npm run compile && node scripts/deploy.js",
 		"watch": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
 		"package": "npx @vscode/vsce package"
 	},
