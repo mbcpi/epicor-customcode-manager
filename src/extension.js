@@ -43,7 +43,10 @@ const treeProvider_1 = require("./treeProvider");
 const executePanel_1 = require("./executePanel");
 const bpmClient_1 = require("./bpmClient");
 const bpmTreeProvider_1 = require("./bpmTreeProvider");
-const { openWidgetPanel } = require("./bpmWidgetPanel");
+const { openBpmWidgetPanel, createBpmHost, typeLabelOf } = require("./bpmWidgetPanel");
+const { openEfxWidgetPanel, createEfxHost } = require("./efxWidgetPanel");
+const { pushNodeCode } = require("./widgetPanel");
+const efxBody_1 = require("./efxBody");
 const updater_1 = require("./updater");
 const kineticLayerClient_1 = require("./kineticLayerClient");
 const { ComparePanel } = require("./comparePanel");
@@ -427,7 +430,23 @@ function activate(context) {
                     vscode.window.showErrorMessage(`Function ${functionId} not found`);
                     return;
                 }
-                const { code, usings } = epicorClient_1.EpicorClient.extractCode(funcRow.Body);
+                // Widget-based functions keep their logic in flow XAML, not in
+                // Code/Usings. A flow that is nothing but one custom-code widget
+                // is still just C#, so it opens as a file; anything richer needs
+                // the graph.
+                const body = efxBody_1.describeBody(funcRow.Body);
+                if (body.unparsedFlow) {
+                    vscode.window.showErrorMessage(
+                        `EFx: ${functionId} has a widget body this extension can't read. Run "EFx: DEV: Dump Function Bodies" for ${libraryId} and share the output — pulling it as C# would corrupt the function.`);
+                    return;
+                }
+                if (body.kind === "flow" && !body.flow.onlyCustomCode) {
+                    await openEfxWidgetPanel(context, client, libraryId, functionId, funcRow.Body);
+                    return;
+                }
+                const widgetNodeId = body.kind === "flow" ? body.flow.codeNodes[0].id : null;
+                const code = widgetNodeId ? body.flow.codeNodes[0].code : body.code;
+                const usings = body.usings;
                 // Write to the profile-scoped storage folder (not the open workspace).
                 const efxDir = await getEfxDir();
                 if (!efxDir) {
@@ -442,11 +461,12 @@ function activate(context) {
                     `// EFx Function: ${libraryId}.${functionId}`,
                     `// Pulled: ${new Date().toISOString()}`,
                     usings ? `// Usings: ${usings}` : "",
+                    widgetNodeId ? `// Widget: ${widgetNodeId}` : "",
                     "// --------------------------------------------------",
                     "",
                 ].filter(l => l !== "").join("\n");
                 fs.writeFileSync(filePath, header.replace(/\s*$/, "") + "\n\n" + code, "utf-8");
-                fileMap.set(normalizeFsPath(filePath), { libraryId, functionId });
+                fileMap.set(normalizeFsPath(filePath), { libraryId, functionId, widgetNodeId });
                 // Open in editor.
                 const doc = await vscode.workspace.openTextDocument(filePath);
                 await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
@@ -456,6 +476,104 @@ function activate(context) {
                 vscode.window.showErrorMessage(`EFx Pull failed: ${err.message}`);
             }
         });
+    }));
+    // -- Pull every function in a library into the storage folder --
+    // Same layout and header as Pull Function (<storage>/<profile>/Libraries/<lib>/).
+    // Code functions -> <fn>.cs (pushable as usual). Widget flows -> <fn>.widgets.txt,
+    // a read-only canonical view of the flow (nodes, settings, code inline).
+    context.subscriptions.push(vscode.commands.registerCommand("efx.pullLibrary", async (node) => {
+        if (!client || !node?.library) {
+            return;
+        }
+        const libraryId = node.library.LibraryID;
+        const efxDir = await getEfxDir();
+        if (!efxDir) {
+            vscode.window.showWarningMessage("EFx: Storage location not set — pull cancelled.");
+            return;
+        }
+        const libDir = path.join(efxDir, libraryId);
+        const SEP = "// --------------------------------------------------";
+        const codeOnly = text => {
+            const t = String(text).replace(/\r\n/g, "\n");
+            const i = t.indexOf(SEP);
+            return (i >= 0 ? t.slice(t.indexOf("\n", i) + 1) : t).trim();
+        };
+        let files = [], skipped = [];
+        try {
+            await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Pulling ${libraryId}...` }, async () => {
+                treeProvider.invalidateCache(libraryId);
+                const tableset = await treeProvider.getLibraryTableset(libraryId);
+                if (!tableset) throw new Error(`Library ${libraryId} not found`);
+                pulledTablesets.set(libraryId, tableset);
+                const { directiveToCanonicalText } = require("./widgetXaml");
+                const stamp = new Date().toISOString();
+                for (const fn of tableset.EfxFunction || []) {
+                    const functionId = fn.FunctionID;
+                    const body = efxBody_1.describeBody(fn.Body);
+                    if (body.unparsedFlow) {
+                        skipped.push(`${functionId} (widget body this extension can't read)`);
+                        continue;
+                    }
+                    if (body.kind === "flow" && !body.flow.onlyCustomCode) {
+                        const header = [`// EFx Function: ${libraryId}.${functionId}`, `// Pulled: ${stamp}`,
+                            "// Widget flow — read-only view; edit in the widget panel", SEP, ""].join("\n");
+                        files.push({ functionId, file: `${functionId}.widgets.txt`, pushable: false,
+                            content: header + "\n" + (directiveToCanonicalText(body.xaml) || body.xaml) });
+                        continue;
+                    }
+                    const widgetNodeId = body.kind === "flow" ? body.flow.codeNodes[0].id : null;
+                    const code = widgetNodeId ? body.flow.codeNodes[0].code : body.code;
+                    const usings = body.usings;
+                    const header = [
+                        `// EFx Function: ${libraryId}.${functionId}`,
+                        `// Pulled: ${stamp}`,
+                        usings ? `// Usings: ${usings}` : "",
+                        widgetNodeId ? `// Widget: ${widgetNodeId}` : "",
+                        SEP,
+                        "",
+                    ].filter(l => l !== "").join("\n");
+                    files.push({ functionId, file: `${functionId}.cs`, pushable: true, widgetNodeId,
+                        content: header.replace(/\s*$/, "") + "\n\n" + code });
+                }
+            });
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`EFx Pull failed: ${err.message}`);
+            return;
+        }
+
+        // Never clobber local work: an open file with unsaved edits is always
+        // skipped; a saved file whose code differs from Epicor is asked about.
+        const openDirty = new Set(vscode.workspace.textDocuments.filter(d => d.isDirty).map(d => normalizeFsPath(d.uri.fsPath)));
+        const dirty = files.filter(f => openDirty.has(normalizeFsPath(path.join(libDir, f.file))));
+        files = files.filter(f => !dirty.includes(f));
+        for (const f of dirty) skipped.push(`${f.functionId} (open with unsaved changes)`);
+        const differs = files.filter(f => {
+            const p = path.join(libDir, f.file);
+            if (!fs.existsSync(p)) return false;
+            try { return codeOnly(fs.readFileSync(p, "utf-8")) !== codeOnly(f.content); } catch { return false; }
+        });
+        if (differs.length) {
+            const pick = await vscode.window.showWarningMessage(
+                `${differs.length} local file(s) in ${libraryId} differ from Epicor (unpushed edits?): ${differs.map(f => f.functionId).join(", ")}`,
+                { modal: true }, "Overwrite", "Keep Local Copies");
+            if (!pick) return;
+            if (pick === "Keep Local Copies") {
+                files = files.filter(f => !differs.includes(f));
+                for (const f of differs) skipped.push(`${f.functionId} (kept local copy)`);
+            }
+        }
+
+        fs.mkdirSync(libDir, { recursive: true });
+        for (const f of files) {
+            const filePath = path.join(libDir, f.file);
+            fs.writeFileSync(filePath, f.content, "utf-8");
+            if (f.pushable) fileMap.set(normalizeFsPath(filePath), { libraryId, functionId: f.functionId, widgetNodeId: f.widgetNodeId });
+        }
+        const msg = `EFx: Pulled ${files.length} function(s) from ${libraryId}` + (skipped.length ? ` — skipped ${skipped.length}: ${skipped.join("; ")}` : "");
+        const act = await (skipped.length ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg, "Reveal in Finder", "Copy Path");
+        if (act === "Reveal in Finder") await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(libDir));
+        else if (act === "Copy Path") await vscode.env.clipboard.writeText(libDir);
     }));
     // -- Push Function --
     context.subscriptions.push(vscode.commands.registerCommand("efx.pushFunction", async (node, skipConfirm = false) => {
@@ -486,6 +604,10 @@ function activate(context) {
             const mapping = await resolveMapping(filePath);
             if (!mapping) {
                 vscode.window.showWarningMessage("EFx: This file is not a pulled EFx function");
+                return;
+            }
+            if (mapping.isWidgetCode) {
+                await pushWidgetCodeFile(filePath, mapping);
                 return;
             }
             libraryId = mapping.libraryId;
@@ -538,6 +660,39 @@ function activate(context) {
                     const funcRow = freshTableset.EfxFunction.find(f => f.FunctionID === functionId);
                     if (!funcRow) {
                         throw new Error(`Function ${functionId} not found on server`);
+                    }
+
+                    // Widget-based function: the C# lives in a custom-code widget
+                    // inside the flow XAML, so the Code/Usings wrapper save would
+                    // wipe the flow. Write it back into the widget instead.
+                    const bodyDesc = efxBody_1.describeBody(funcRow.Body);
+                    if (bodyDesc.unparsedFlow) {
+                        throw new Error(`${functionId} has a widget body this extension can't read — refusing to overwrite it with C#.`);
+                    }
+                    if (bodyDesc.kind === "flow") {
+                        const mapping = await resolveMapping(filePath);
+                        const nodeId = mapping?.widgetNodeId
+                            || (bodyDesc.flow.codeNodes.length === 1 ? bodyDesc.flow.codeNodes[0].id : null);
+                        if (!nodeId) {
+                            throw new Error(`${functionId} has ${bodyDesc.flow.codeNodes.length} custom-code widgets — edit them from the widget graph.`);
+                        }
+                        const host = createEfxHost(client, libraryId, functionId, funcRow.Body);
+                        await pushNodeCode(host, nodeId, fileContent);
+
+                        // Verify against the server copy, same as the code path.
+                        const verifyTs = await client.getLibrary(libraryId);
+                        const verifyRow = verifyTs.EfxFunction.find(f => f.FunctionID === functionId);
+                        const verifyNode = efxBody_1.describeBody(verifyRow?.Body).flow?.codeNodes
+                            .find(n => n.id === nodeId);
+                        if (!verifyNode || normalizeCodeForCompare(verifyNode.code) !== normalizeCodeForCompare(fileContent)) {
+                            throw new Error("EFx Push verification failed: server widget code does not match editor text.");
+                        }
+
+                        efxDiagnostics.set(vscode.Uri.file(filePath), []);
+                        vscode.window.showInformationMessage(`EFx: Verified save of ${libraryId}.${functionId} (widget ${nodeId})`);
+                        treeProvider.invalidateCache(libraryId);
+                        clearSearchCache();
+                        return;
                     }
 
                     // Preserve existing Usings while replacing only Code.
@@ -1550,7 +1705,7 @@ function activate(context) {
         if (mapping && mapping.isBpm && mapping.functionDefinition) {
             scheduleBpmValidation(filePath, mapping);
         }
-        if (mapping && !mapping.isBpm && client) {
+        if (mapping && !mapping.isBpm && !mapping.widgetNodeId && !mapping.isWidgetCode && client) {
             // EFx: scheduleEfxValidation manages its own state machine — no text passed here.
             // It always reads fresh document text at fire time so DIRTY re-runs get current code.
             scheduleEfxValidation(filePath, mapping);
@@ -1563,6 +1718,12 @@ function activate(context) {
         // Skip if the save was triggered by our own push handler (prevents double-push).
         if (pushInProgress.has(normalized)) return;
         const mapping = await resolveMapping(doc.uri.fsPath);
+        // A widget scratch file exists only to edit one widget — saving is the
+        // push, no separate command and no autoPush opt-in.
+        if (mapping?.isWidgetCode) {
+            await pushWidgetCodeFile(doc.uri.fsPath, mapping);
+            return;
+        }
         if (!mapping || mapping.isBpm || !client) return;
         const activeProfile = getActiveProfile();
         if (!activeProfile?.autoPush) return;
@@ -1645,6 +1806,10 @@ function activate(context) {
 
         try {
             if (!client || !mapping.libraryId || !mapping.functionId) return;
+            // The Code/Usings wrapper save can't express a widget flow, so
+            // validating a widget-backed file would overwrite it. Push handles
+            // validation for those.
+            if (mapping.widgetNodeId || mapping.isWidgetCode) return;
 
             // Always read current document text — critical for DIRTY re-runs
             const openDoc = vscode.workspace.textDocuments.find(
@@ -1769,7 +1934,106 @@ function activate(context) {
         if (nodeOrArg?.directive) directive = nodeOrArg.directive;
         else if (nodeOrArg instanceof bpmTreeProvider_1.BpmDirectiveNode) directive = nodeOrArg.directive;
         if (!directive) { vscode.window.showWarningMessage('BPM: Select a directive'); return; }
-        openWidgetPanel(context, bpmClientInst, directive);
+        openBpmWidgetPanel(context, bpmClientInst, directive);
+    }));
+
+    // ── EFx: Open Function Widget Graph ──
+    context.subscriptions.push(vscode.commands.registerCommand("efx.openFunctionWidgets", async (nodeOrArg) => {
+        if (!client) {
+            vscode.window.showWarningMessage("EFx: Configure connection first");
+            return;
+        }
+        const libraryId = nodeOrArg?.libraryId;
+        const functionId = nodeOrArg?.func?.FunctionID || nodeOrArg?.functionId;
+        if (!libraryId || !functionId) {
+            vscode.window.showWarningMessage("EFx: Select a function");
+            return;
+        }
+        try {
+            await openEfxWidgetPanel(context, client, libraryId, functionId, nodeOrArg?.func?.Body);
+        } catch (err) {
+            vscode.window.showErrorMessage(`EFx: Could not open widget graph — ${err.message}`);
+        }
+    }));
+
+    // ── Widget: Open one custom-code widget in a real editor ──
+    // Raised by a double-click in the widget graph. The file is a scratch copy
+    // of that widget's C#; saving it pushes straight back into the widget.
+    context.subscriptions.push(vscode.commands.registerCommand("efx.widget.openCode", async (arg) => {
+        const meta = arg?.meta;
+        if (!meta || !arg.nodeId) return;
+
+        const profileRoot = await getProfileStorageRoot();
+        if (!profileRoot) {
+            vscode.window.showWarningMessage("EFx: Storage location not set — cannot open widget code.");
+            return;
+        }
+
+        const safe = v => String(v || "").replace(/[^a-zA-Z0-9_\-. ]/g, "_");
+        const isBpm = meta.kind === "bpm";
+        const ownerDir = isBpm
+            ? path.join(profileRoot, "Widgets", "BPM", safe(meta.bpMethodCode), safe(meta.name))
+            : path.join(profileRoot, "Widgets", safe(meta.libraryId), safe(meta.functionId));
+        fs.mkdirSync(ownerDir, { recursive: true });
+        const filePath = path.join(ownerDir, `${safe(arg.nodeId)}.cs`);
+
+        // BPM widget code gets the same live syntax checking pulled directives get.
+        let functionDefinition = null;
+        if (isBpm && bpmClientInst) {
+            try {
+                const tableset = await bpmClientInst.getBpmMethod("BO", meta.bpMethodCode);
+                const method = tableset?.BpMethod?.[0];
+                if (method) functionDefinition = bpmClient_1.buildFunctionDefinition(method, tableset?.BpArgument || []);
+            } catch {
+                // Validation is a bonus — never block opening the code on it.
+            }
+        }
+
+        const header = (isBpm
+            ? [
+                `// BPM Directive: ${meta.name}`,
+                `// Method: ${meta.bpMethodCode}`,
+                `// Type: ${typeLabelOf(meta.directiveType)}`,
+                `// DirectiveID: ${meta.directiveId}`,
+            ]
+            : [
+                `// EFx Function: ${meta.libraryId}.${meta.functionId}`,
+            ]).concat([
+                `// Widget Code: ${arg.nodeId} (${arg.label})`,
+                `// Pulled: ${new Date().toISOString()}`,
+                "// Saving this file pushes the code back into this widget.",
+                "// --------------------------------------------------",
+                "",
+            ]);
+
+        // Re-opening a widget must not throw away edits that haven't been saved
+        // (and therefore pushed) yet.
+        const openDirty = vscode.workspace.textDocuments.find(
+            d => normalizeFsPath(d.uri.fsPath) === normalizeFsPath(filePath) && d.isDirty);
+        if (!openDirty) {
+            fs.writeFileSync(filePath, header.join("\n") + "\n" + (arg.code || ""), "utf-8");
+        }
+
+        fileMap.set(normalizeFsPath(filePath), {
+            isWidgetCode: true,
+            nodeId: arg.nodeId,
+            widgetMeta: meta,
+            isBpm,
+            libraryId: isBpm ? "__BPM__" : meta.libraryId,
+            functionId: isBpm ? meta.directiveId : meta.functionId,
+            bpmMethodCode: meta.bpMethodCode,
+            directiveId: meta.directiveId,
+            directiveType: meta.directiveType,
+            functionDefinition,
+        });
+
+        const doc = await vscode.workspace.openTextDocument(filePath);
+        await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        vscode.window.showInformationMessage(`Widget "${arg.label}" opened — save to push it back to Epicor.`);
+
+        if (functionDefinition) {
+            scheduleBpmValidation(filePath, fileMap.get(normalizeFsPath(filePath)));
+        }
     }));
 
     // ── BPM: Pull Directive Code ──
@@ -1896,6 +2160,13 @@ function activate(context) {
             }
             filePath = editor.document.uri.fsPath;
             mapping = await resolveMapping(filePath);
+        }
+
+        if (mapping?.isWidgetCode) {
+            // Replacing "the first CustomCodeAction" would hit the wrong widget —
+            // push into the exact node this file came from.
+            await pushWidgetCodeFile(filePath, mapping);
+            return;
         }
 
         if (!mapping || !mapping.isBpm) {
@@ -2130,6 +2401,46 @@ function activate(context) {
     }));
     */
     // ── DIAGNOSTIC: dump widget XAML for a BPM directive ──────────────────────
+    // ── DEV: Dump a library's function bodies ──
+    // Widget-based functions are new territory — this shows exactly what shape
+    // Epicor returns for each one so a mis-detection is easy to spot.
+    context.subscriptions.push(vscode.commands.registerCommand("efx.dev.dumpFunctionBody", async () => {
+        if (!client) {
+            vscode.window.showErrorMessage("EFx: Not connected — configure a profile first.");
+            return;
+        }
+        const libraryId = await vscode.window.showInputBox({
+            prompt: "Library ID to dump",
+            ignoreFocusOut: true,
+        });
+        if (!libraryId) return;
+
+        const out = vscode.window.createOutputChannel("EFx Function Body Dump");
+        out.show(true);
+        out.appendLine(`Fetching ${libraryId}...`);
+        try {
+            const ts = await client.getLibrary(libraryId.trim());
+            const fns = ts?.EfxFunction || [];
+            out.appendLine(`Got ${fns.length} function(s)\n`);
+            for (const fn of fns) {
+                const desc = efxBody_1.describeBody(fn.Body);
+                out.appendLine("=".repeat(70));
+                out.appendLine(`${fn.FunctionID}  Kind=${fn.Kind}  → ${efxBody_1.bodyKindLabel(desc)}`);
+                if (desc.kind === "flow") {
+                    out.appendLine(`  envelope property: ${desc.xamlProp || "(raw XAML)"}`);
+                    for (const n of desc.flow.codeNodes) {
+                        out.appendLine(`  code widget ${n.id} (${n.label}), ${n.code.split("\n").length} lines`);
+                    }
+                }
+                out.appendLine("  --- raw Body ---");
+                out.appendLine(fn.Body || "(empty)");
+                out.appendLine("");
+            }
+        } catch (err) {
+            out.appendLine(`ERROR: ${err.message}`);
+        }
+    }));
+
     context.subscriptions.push(vscode.commands.registerCommand("efx.dev.dumpBpmXaml", async () => {
         if (!bpmClientInst) {
             vscode.window.showErrorMessage("EFx: Not connected — configure a profile first.");
@@ -2893,6 +3204,46 @@ function parseHeaderFields(filePath) {
     }
     return fields;
 }
+// Rebuilds the widget host a scratch .cs file belongs to, so a save still
+// pushes after the graph panel that opened it has been closed.
+function hostFromWidgetMeta(meta) {
+    if (!meta) return null;
+    if (meta.kind === 'bpm') {
+        if (!bpmClientInst) return null;
+        return createBpmHost(bpmClientInst, {
+            DirectiveID: meta.directiveId,
+            BpMethodCode: meta.bpMethodCode,
+            Name: meta.name,
+            DirectiveType: meta.directiveType,
+        });
+    }
+    if (!client) return null;
+    return createEfxHost(client, meta.libraryId, meta.functionId);
+}
+
+async function pushWidgetCodeFile(filePath, mapping) {
+    const host = hostFromWidgetMeta(mapping.widgetMeta);
+    if (!host) {
+        vscode.window.showWarningMessage('EFx: Configure connection first');
+        return;
+    }
+    const { content } = stripGeneratedHeaderInfo(fs.readFileSync(filePath, 'utf-8'));
+    await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Pushing widget ${mapping.nodeId}...` },
+        async () => {
+            try {
+                await pushNodeCode(host, mapping.nodeId, content);
+                vscode.window.showInformationMessage(`${host.heading}: widget "${mapping.nodeId}" saved.`);
+                if (mapping.widgetMeta.kind === 'efx') {
+                    treeProvider.invalidateCache(mapping.widgetMeta.libraryId);
+                    clearSearchCache();
+                }
+            } catch (err) {
+                vscode.window.showErrorMessage(`Widget push failed: ${err.message}`);
+            }
+        });
+}
+
 // fileMap is in-memory only, so it starts empty on every VS Code restart.
 // This recovers an entry for a file pulled in a previous session by reading
 // the folder structure (EFx: <Library>/<Function>.cs) or the header comment
@@ -2903,6 +3254,10 @@ async function resolveMapping(filePath) {
     if (existing) return existing;
     if (!filePath.endsWith('.cs') || !fs.existsSync(filePath)) return null;
     const fields = parseHeaderFields(filePath);
+    // "// Widget Code: <nodeId> (<label>)" marks a scratch file for one widget.
+    const widgetCodeId = fields['Widget Code']
+        ? String(fields['Widget Code']).split(' (')[0].trim()
+        : null;
     if (fields['BPM Directive'] && fields['Method'] && fields['DirectiveID']) {
         if (!bpmClientInst) return null;
         const bpmMethodCode = fields['Method'];
@@ -2915,6 +3270,11 @@ async function resolveMapping(filePath) {
             const args = tableset?.BpArgument || [];
             const functionDefinition = method ? bpmClient_1.buildFunctionDefinition(method, args) : null;
             const mapping = { libraryId: '__BPM__', functionId: directiveId, bpmMethodCode, directiveId, directiveType, isBpm: true, functionDefinition };
+            if (widgetCodeId) {
+                mapping.isWidgetCode = true;
+                mapping.nodeId = widgetCodeId;
+                mapping.widgetMeta = { kind: 'bpm', bpMethodCode, directiveId, directiveType, name: fields['BPM Directive'] };
+            }
             fileMap.set(normalized, mapping);
             return mapping;
         }
@@ -2923,9 +3283,31 @@ async function resolveMapping(filePath) {
         }
     }
     if (fields['EFx Function']) {
+        if (widgetCodeId) {
+            // Header carries "<library>.<function>"; the folders below
+            // <profileRoot>/Widgets are only a fallback for a mangled header.
+            const dot = String(fields['EFx Function']).indexOf('.');
+            const libraryId = dot > 0
+                ? String(fields['EFx Function']).slice(0, dot)
+                : path.basename(path.dirname(path.dirname(filePath)));
+            const functionId = dot > 0
+                ? String(fields['EFx Function']).slice(dot + 1)
+                : path.basename(path.dirname(filePath));
+            const mapping = {
+                libraryId, functionId,
+                isWidgetCode: true,
+                nodeId: widgetCodeId,
+                widgetMeta: { kind: 'efx', libraryId, functionId },
+            };
+            fileMap.set(normalized, mapping);
+            return mapping;
+        }
         const functionId = path.basename(filePath, '.cs');
         const libraryId = path.basename(path.dirname(filePath));
-        const mapping = { libraryId, functionId };
+        // "// Widget: <nodeId>" means the C# lives in a custom-code widget
+        // rather than the function's Code column.
+        const widgetNodeId = fields['Widget'] ? String(fields['Widget']).split(' (')[0].trim() : null;
+        const mapping = { libraryId, functionId, widgetNodeId };
         fileMap.set(normalized, mapping);
         return mapping;
     }

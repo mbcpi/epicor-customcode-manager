@@ -13,7 +13,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const vscode = require("vscode");
-const { EpicorClient } = require("./epicorClient");
+const { bodyCodeText } = require("./efxBody");
 
 // Cache key is server+company so switching profiles can't show another
 // environment's code. Cleared on refresh / after a push.
@@ -59,9 +59,10 @@ async function loadCorpus(client) {
 
     const fns = [];
     for (const fn of (ts.EfxFunction || [])) {
-        // Kind 0 is widget-only — no code body to search.
-        if (fn.Kind !== 1 && fn.Kind !== 2) continue;
-        const { code } = EpicorClient.extractCode(fn.Body);
+        // bodyCodeText covers both shapes: a code function's Code column and
+        // every custom-code widget of a widget-based one.
+        const code = bodyCodeText(fn.Body);
+        if (!code) continue;
         fns.push({
             libraryId: fn.LibraryID,
             functionId: fn.FunctionID,

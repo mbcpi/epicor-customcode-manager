@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.EfxTreeProvider = exports.FunctionNode = exports.LibraryNode = void 0;
 const vscode = __importStar(require("vscode"));
+const { describeBody, bodyKindLabel } = require("./efxBody");
 class LibraryNode extends vscode.TreeItem {
     constructor(library) {
         super(library.LibraryID, vscode.TreeItemCollapsibleState.Collapsed);
@@ -88,28 +89,47 @@ class FunctionNode extends vscode.TreeItem {
         this.signatures = signatures;
         const requestParams = signatures.filter(s => !s.Response).map(s => s.ArgumentName);
         const responseParams = signatures.filter(s => s.Response).map(s => s.ArgumentName);
-        this.description = func.Description || "";
+
+        // A widget-based function only earns the graph view when the graph says
+        // something the C# doesn't — a lone custom-code widget opens as code.
+        const body = describeBody(func.Body);
+        const isGraph = body.kind === "flow" && !body.flow.onlyCustomCode;
+
+        this.description = [func.Description || "", isGraph ? `${body.flow.nodeCount} widgets` : ""]
+            .filter(Boolean).join(" · ");
         this.tooltip = [
             `${func.LibraryID}.${func.FunctionID}`,
             func.Description || "",
-            `Kind: ${func.Kind === 2 ? "Code-based" : func.Kind === 1 ? "Widget + Code" : "Widget"}`,
+            bodyKindLabel(body),
             requestParams.length ? `Request: ${requestParams.join(", ")}` : "Request: (none)",
             `Response: ${responseParams.join(", ")}`,
             func.Disabled ? "DISABLED" : "",
             func.Invalid ? "INVALID" : "",
         ].filter(Boolean).join("\n");
-        this.contextValue = "function";
-        this.iconPath = new vscode.ThemeIcon(func.Invalid ? "warning" : func.Disabled ? "circle-slash" : "symbol-function");
-        // Click to pull. Pass a plain object, not this FunctionNode, to avoid circular command args.
-        this.command = {
-            command: "efx.pullFunction",
-            title: "Pull Function",
-            arguments: [{
-                libraryId: this.libraryId,
-                func: this.func,
-                signatures: this.signatures,
-            }],
-        };
+        this.contextValue = isGraph ? "function-widgets" : "function";
+        this.iconPath = new vscode.ThemeIcon(
+            func.Invalid ? "warning"
+                : func.Disabled ? "circle-slash"
+                    : isGraph ? "type-hierarchy"
+                        : "symbol-function");
+        // Click opens the graph for multi-widget flows, the C# for everything
+        // else. Pass a plain object, not this FunctionNode, to avoid circular
+        // command args.
+        this.command = isGraph
+            ? {
+                command: "efx.openFunctionWidgets",
+                title: "Open Widget Graph",
+                arguments: [{ libraryId: this.libraryId, func: this.func }],
+            }
+            : {
+                command: "efx.pullFunction",
+                title: "Pull Function",
+                arguments: [{
+                    libraryId: this.libraryId,
+                    func: this.func,
+                    signatures: this.signatures,
+                }],
+            };
     }
 }
 class FunctionGroupNode extends vscode.TreeItem {
@@ -271,8 +291,7 @@ class EfxTreeProvider {
 
             const groups = [];
 
-            const functions = (tableset.EfxFunction || [])
-                .filter(f => f.Kind === 2 || f.Kind === 1);
+            const functions = tableset.EfxFunction || [];
 
             const tables = tableset.EfxRefTable || [];
             const services = tableset.EfxRefService || [];
@@ -302,7 +321,6 @@ class EfxTreeProvider {
             }
 
             return (tableset.EfxFunction || [])
-                .filter(f => f.Kind === 2 || f.Kind === 1)
                 .sort((a, b) => a.FunctionID.localeCompare(b.FunctionID))
                 .map(func => {
                     const sigs = (tableset.EfxFunctionSignature || [])

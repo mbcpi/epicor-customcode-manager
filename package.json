@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.7.1",
+	"version": "0.8.1",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -99,6 +99,23 @@
 				"command": "efx.pullFunction",
 				"title": "Pull Function Code",
 				"icon": "$(cloud-download)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.pullLibrary",
+				"title": "Pull All Functions",
+				"icon": "$(cloud-download)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.openFunctionWidgets",
+				"title": "Open Widget Graph",
+				"icon": "$(type-hierarchy)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.widget.openCode",
+				"title": "Open Widget Custom Code",
 				"category": "EFx"
 			},
 			{
@@ -209,6 +226,11 @@
 				"category": "EFx"
 			},
 			{
+				"command": "efx.dev.dumpFunctionBody",
+				"title": "DEV: Dump Function Bodies",
+				"category": "EFx"
+			},
+			{
 				"command": "efx.compareLibraries",
 				"title": "Compare Libraries",
 				"icon": "$(diff)",
@@ -275,6 +297,16 @@
 			],
 			"view/item/context": [
 				{
+					"command": "efx.pullLibrary",
+					"when": "view == efxLibraries && viewItem == library-promoted",
+					"group": "navigation@0"
+				},
+				{
+					"command": "efx.pullLibrary",
+					"when": "view == efxLibraries && viewItem == library-unpromoted",
+					"group": "navigation@0"
+				},
+				{
 					"command": "efx.pullFunction",
 					"when": "view == efxLibraries && viewItem == function",
 					"group": "inline@1"
@@ -292,6 +324,21 @@
 				{
 					"command": "efx.deleteFunction",
 					"when": "view == efxLibraries && viewItem == function",
+					"group": "danger@1"
+				},
+				{
+					"command": "efx.openFunctionWidgets",
+					"when": "view == efxLibraries && viewItem == function-widgets",
+					"group": "inline@1"
+				},
+				{
+					"command": "efx.executeFunction",
+					"when": "view == efxLibraries && viewItem == function-widgets",
+					"group": "inline@2"
+				},
+				{
+					"command": "efx.deleteFunction",
+					"when": "view == efxLibraries && viewItem == function-widgets",
 					"group": "danger@1"
 				},
 				{
@@ -390,6 +437,10 @@
 				},
 				{
 					"command": "efx.searchInLibrary",
+					"when": "false"
+				},
+				{
+					"command": "efx.pullLibrary",
 					"when": "false"
 				}
 			]

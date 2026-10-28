@@ -1,5 +1,11 @@
 "use strict";
 
+// Widget-flow XAML parsing and mutation.
+//
+// Shared by BPM directives (BpDirective.Body) and Epicor Functions
+// (EfxFunction.Body) — both store the same widget graph, only the name of the
+// root element differs, so nothing in here assumes a BPM.
+
 const { DOMParser, XMLSerializer } = require('@xmldom/xmldom');
 
 const XAML_NS = 'http://schemas.microsoft.com/winfx/2006/xaml';
@@ -226,6 +232,23 @@ function extractWidget(el) {
     return { localName, attrs, code, message, conditions, actionExpressionText, actionFieldInfo, paramBindings, label: ACTION_LABELS[localName] || CONDITION_LABELS[localName] || localName };
 }
 
+// The flow's first node. BPM wraps it in <DirectiveDefinition2.StartNode>;
+// Epicor Functions use the same wrapper under their own root element name, so
+// match on the ".StartNode" suffix rather than a hard-coded element name.
+// Falls back to a step/condition sitting directly under the root.
+function findStartElement(root) {
+    for (let i = 0; i < root.childNodes.length; i++) {
+        const c = root.childNodes[i];
+        if (c.nodeType === 1 && c.localName.endsWith('.StartNode')) return firstElement(c);
+    }
+    for (let i = 0; i < root.childNodes.length; i++) {
+        const c = root.childNodes[i];
+        if (c.nodeType !== 1) continue;
+        if (c.localName === 'DirectiveStep' || c.localName === 'DirectiveCondition') return c;
+    }
+    return null;
+}
+
 // ─── Main parser ───────────────────────────────────────────────────────────────
 
 function parseDirective(bodyXml) {
@@ -236,7 +259,7 @@ function parseDirective(bodyXml) {
     }).parseFromString(bodyXml, 'text/xml');
 
     const root = doc.documentElement;
-    if (!root || root.localName !== 'DirectiveDefinition2') return null;
+    if (!root) return null;
 
     const nodes = [];
     const edges = [];
@@ -283,10 +306,55 @@ function parseDirective(bodyXml) {
         }
     }
 
-    const startWrapper = childByLocalName(root, 'DirectiveDefinition2.StartNode');
-    if (startWrapper) walk(firstElement(startWrapper), null, null);
+    const startEl = findStartElement(root);
+    if (startEl) walk(startEl, null, null);
 
     return { nodes, edges, startNodeId: nodes[0]?.id ?? null, doc, root };
+}
+
+// ─── Flow shape ───────────────────────────────────────────────────────────────
+
+const CODE_WIDGETS = new Set(['CustomCodeAction', 'CustomCodeCondition']);
+
+function isCustomCodeWidget(widget) {
+    return !!widget && CODE_WIDGETS.has(widget.localName);
+}
+
+// Does this string look like a widget-flow XAML document rather than JSON/C#?
+function looksLikeFlowXaml(body) {
+    if (!body) return false;
+    const head = String(body).trimStart().slice(0, 400);
+    return head.startsWith('<') && /Directive(Step|Condition|Definition)/.test(head);
+}
+
+// Summarise a body's widget graph so callers can decide how to present it.
+// Returns null when the body isn't a parseable flow.
+//
+//   nodeCount        — every step/condition in the graph
+//   codeNodes        — the custom-code widgets, in walk order
+//   onlyCustomCode   — exactly one node, and it is a custom-code widget, so the
+//                      graph carries no information the C# doesn't
+function summarizeFlow(bodyXml) {
+    if (!looksLikeFlowXaml(bodyXml)) return null;
+    let parsed;
+    try { parsed = parseDirective(bodyXml); } catch { return null; }
+    if (!parsed || parsed.nodes.length === 0) return null;
+
+    const codeNodes = parsed.nodes
+        .filter(n => isCustomCodeWidget(n.widget))
+        .map(n => ({
+            id: n.id,
+            type: n.type,
+            label: n.widget.label,
+            localName: n.widget.localName,
+            code: n.widget.code || '',
+        }));
+
+    return {
+        nodeCount: parsed.nodes.length,
+        codeNodes,
+        onlyCustomCode: parsed.nodes.length === 1 && codeNodes.length === 1,
+    };
 }
 
 // ─── Mutation helpers ─────────────────────────────────────────────────────────
@@ -548,4 +616,4 @@ function directiveToCanonicalText(bodyXml) {
     return out.join('\n');
 }
 
-module.exports = { parseDirective, setNodeCode, setRaiseExceptionMessage, setNodeAttrs, setConditionChildren, setInvokeFunctionAction, setActionField, directiveToCanonicalText };
+module.exports = { parseDirective, summarizeFlow, looksLikeFlowXaml, isCustomCodeWidget, setNodeCode, setRaiseExceptionMessage, setNodeAttrs, setConditionChildren, setInvokeFunctionAction, setActionField, directiveToCanonicalText };

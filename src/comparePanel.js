@@ -1,8 +1,15 @@
 "use strict";
 const vscode = require("vscode");
 const { EpicorClient } = require("./epicorClient");
-const { BpmClient, extractBpmCode, formatBpmBodyXaml } = require("./bpmClient");
-const { directiveToCanonicalText } = require("./bpmXaml");
+const { BpmClient } = require("./bpmClient");
+const CompareBpm = require("./compareBpm");
+const CompareLayers = require("./compareLayers");
+// Webview-side script for the BPM + Layers tabs. Kept as .txt so esbuild
+// bundles it as a plain string (default text loader) — it is browser JS,
+// injected after the panel's main <script>.
+const COMPARE_WEBVIEW_JS = require("./compareWebview.txt");
+const { directiveToCanonicalText } = require("./widgetXaml");
+const { describeBody } = require("./efxBody");
 const { KineticMetaFXClient } = require("./kineticLayerClient");
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -10,9 +17,15 @@ const { KineticMetaFXClient } = require("./kineticLayerClient");
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function parseFunctionBody(bodyStr) {
-    if (!bodyStr) return { code: '', usings: '' };
-    try { const b = JSON.parse(bodyStr); return { code: b.Code || '', usings: b.Usings || '' }; }
-    catch { return { code: bodyStr, usings: '' }; }
+    const desc = describeBody(bodyStr);
+    if (desc.kind !== 'flow') return { code: desc.code, usings: desc.usings, isFlow: false };
+    // Render a widget-based function the way BPM directives are rendered, so a
+    // dragged widget or a renamed node doesn't read as a code change.
+    return {
+        code: directiveToCanonicalText(desc.xaml) || desc.xaml,
+        usings: desc.usings,
+        isFlow: true,
+    };
 }
 
 function buildFnMap(data) {
@@ -44,10 +57,10 @@ function buildFnMap(data) {
 
     const fnMap = {};
     for (const fn of fns) {
-        const { code, usings } = parseFunctionBody(fn.Body);
+        const { code, usings, isFlow } = parseFunctionBody(fn.Body);
         if (!fnMap[fn.LibraryID]) fnMap[fn.LibraryID] = {};
         fnMap[fn.LibraryID][fn.FunctionID] = {
-            ...fn, _code: code, _usings: usings,
+            ...fn, _code: code, _usings: usings, _isFlow: isFlow,
             _sig: sigMap[`${fn.LibraryID}|${fn.FunctionID}`] || { inputs: [], outputs: [] },
         };
     }
@@ -140,77 +153,6 @@ function buildLibraryCompare(libListA, libListB, fnMapA, fnMapB, refMapA, refMap
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BPM COMPARE HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function compareDirective(da, db) {
-    const fields = {}; let hasDiff = false;
-    const cA = da._code || '', cB = db._code || '', codeSame = cA === cB;
-    if (!codeSame) hasDiff = true;
-    fields.Code = { a: cA, b: cB, same: codeSame };
-    // Full widget/XAML comparison — directives can differ in widgets while the
-    // (first) custom-code block matches, or have no code at all. Bodies are
-    // only shipped to the webview when they actually differ.
-    const xA = da._bodyNorm || '', xB = db._bodyNorm || '', xamlSame = xA === xB;
-    if (!xamlSame) hasDiff = true;
-    fields.Xaml = xamlSame ? { a: '', b: '', same: true } : { a: xA, b: xB, same: false };
-    for (const key of ['DirectiveType', 'IsEnabled', 'Sequence']) {
-        const va = String(da[key] ?? ''), vb = String(db[key] ?? ''), same = va === vb;
-        if (!same) hasDiff = true;
-        fields[key] = { a: va, b: vb, same };
-    }
-    fields.hasDiff = hasDiff;
-    return fields;
-}
-
-function safeDirective(d) {
-    if (!d) return null;
-    return { name: d.Name || '', DirectiveType: d.DirectiveType, IsEnabled: d.IsEnabled,
-        Sequence: d.Sequence, hasCode: d.hasCode || false, _code: d._code || '' };
-}
-
-function buildBpmCompare(methodsA, directivesA, methodsB, directivesB) {
-    const methodMapA = {}, methodMapB = {};
-    for (const m of methodsA) methodMapA[m.BpMethodCode] = m;
-    for (const m of methodsB) methodMapB[m.BpMethodCode] = m;
-
-    const dirMapA = {}, dirMapB = {};
-    for (const d of directivesA) { if (!dirMapA[d.BpMethodCode]) dirMapA[d.BpMethodCode] = {}; dirMapA[d.BpMethodCode][d.Name] = d; }
-    for (const d of directivesB) { if (!dirMapB[d.BpMethodCode]) dirMapB[d.BpMethodCode] = {}; dirMapB[d.BpMethodCode][d.Name] = d; }
-
-    const allCodes = [...new Set([...Object.keys(methodMapA), ...Object.keys(methodMapB)])].sort();
-    const serviceMap = {};
-    for (const code of allCodes) {
-        const m = methodMapA[code] || methodMapB[code];
-        const svcKey = `${m.SystemCode || 'Erp'}:${m.BusinessObject || code}`;
-        if (!serviceMap[svcKey]) serviceMap[svcKey] = { systemCode: m.SystemCode || 'Erp', businessObject: m.BusinessObject || code, methods: [] };
-        const dirsA = dirMapA[code] || {}, dirsB = dirMapB[code] || {};
-        const allDirNames = [...new Set([...Object.keys(dirsA), ...Object.keys(dirsB)])].sort();
-        const dirDiffs = [];
-        for (const name of allDirNames) {
-            const da = dirsA[name], db = dirsB[name];
-            if (!da)      dirDiffs.push({ name, status: 'only-b', da: null,          db: safeDirective(db) });
-            else if (!db) dirDiffs.push({ name, status: 'only-a', da: safeDirective(da), db: null });
-            else { const fields = compareDirective(da, db); dirDiffs.push({ name, status: fields.hasDiff ? 'diff' : 'match', da: safeDirective(da), db: safeDirective(db), fields }); }
-        }
-        const inA = code in methodMapA, inB = code in methodMapB;
-        let status = !inA ? 'only-b' : !inB ? 'only-a' : dirDiffs.some(d => d.status !== 'match') ? 'diff' : 'match';
-        serviceMap[svcKey].methods.push({ methodCode: code, methodName: m.Name || code, status, inA, inB, dirDiffs });
-    }
-
-    const services = Object.entries(serviceMap).map(([svcKey, svc]) => {
-        const diffCount = svc.methods.reduce((n, m) => n + m.dirDiffs.filter(d => d.status !== 'match').length, 0);
-        const status = svc.methods.some(m => m.status !== 'match') ? 'diff' : 'match';
-        return { svcKey, systemCode: svc.systemCode, businessObject: svc.businessObject, status, diffCount, methods: svc.methods };
-    });
-    services.sort((a, b) => { const o = { diff: 0, 'only-a': 1, 'only-b': 2, match: 3 }; return (o[a.status] ?? 4) - (o[b.status] ?? 4) || a.businessObject.localeCompare(b.businessObject); });
-
-    const counts = { match: 0, diff: 0 };
-    for (const s of services) counts[s.status] = (counts[s.status] || 0) + 1;
-    return { services, counts, total: services.length };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // JSON NORMALIZATION  (for layer file diffs)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -245,6 +187,7 @@ class ComparePanel {
                     case 'fetchLayerList':    await this._fetchLayerList(msg); break;
                     case 'fetchLayerContent': await this._fetchLayerContent(msg); break;
                     case 'openNativeDiff':    await this._openNativeDiff(msg); break;
+                    case 'openBpmRaw':        await this._openBpmRaw(msg); break;
                     case 'applyFunction':     await this._applyFunction(msg); break;
                 }
             } catch (err) {
@@ -342,14 +285,13 @@ class ComparePanel {
         try {
             const [cA, cB] = await Promise.all([this._efxClient(profileA, companyA), this._efxClient(profileB, companyB)]);
             const bA = new BpmClient(cA), bB = new BpmClient(cB);
+            const warnings = [];
 
-            // Use the same proven approach as the BPM tree provider:
-            // 1. GetBpmDirectiveServicesTS → list of services that have directives
-            // 2. GetRowsEx per service with specific where clause
-            const fetchAll = async (bpm) => {
+            // Method directives: same proven path as the BPM tree provider
+            // (GetBpmDirectiveServicesTS -> GetRowsEx per service, 6 at a time).
+            // Data directives (source 'DB') come from one GetRowsEx call.
+            const fetchAll = async (bpm, label) => {
                 const services = await bpm.getBpmServices();
-                // Fetch per-service rows with limited concurrency — the old serial
-                // loop made compare time = service count × round-trip latency.
                 const CONCURRENCY = 6;
                 const results = new Array(services.length);
                 let next = 0;
@@ -363,29 +305,57 @@ class ComparePanel {
                 await Promise.all(Array.from({ length: Math.min(CONCURRENCY, services.length) }, worker));
                 const methods = [], directives = [];
                 for (const data of results) {
-                    methods.push(...data.methods);
-                    for (const d of data.directives) {
-                        const { code, hasCustomCode } = extractBpmCode(d.Body || '');
-                        // Semantic representation via the real XAML parser: every
-                        // node, every code block, conditions, bindings, edges —
-                        // with designer noise (positions, x:Name churn) excluded.
-                        // Falls back to raw formatted XAML when not parseable.
-                        const canon = directiveToCanonicalText(d.Body || '');
-                        directives.push({
-                            BpMethodCode: d.BpMethodCode, Name: d.Name,
-                            DirectiveType: d.DirectiveType, IsEnabled: d.IsEnabled,
-                            Sequence: d.Sequence, _code: code, hasCode: hasCustomCode,
-                            _bodyNorm: canon ?? formatBpmBodyXaml(d.Body || ''),
-                        });
-                    }
+                    for (const m of data.methods) methods.push({ ...m, Source: m.Source || 'BO' });
+                    for (const d of data.directives) directives.push({ ...d, Source: d.Source || 'BO' });
                 }
-                return { methods, directives };
+                try {
+                    const db = await bpm.getBpmRowsBySource('DB');
+                    for (const m of db.methods) methods.push({ ...m, Source: 'DB' });
+                    for (const d of db.directives) directives.push({ ...d, Source: 'DB' });
+                } catch (e) {
+                    warnings.push(`${label}: data directives not loaded — ${e.message}`);
+                }
+                // A directive can only appear once per environment.
+                const seen = new Set();
+                return { methods, directives: directives.filter(d => {
+                    const k = d.DirectiveID || CompareBpm.directiveKey(d);
+                    if (seen.has(k)) return false; seen.add(k); return true;
+                }) };
             };
 
             this._post({ command: 'status', text: 'Fetching BPM directives from both environments…' });
-            const [dA, dB] = await Promise.all([fetchAll(bA), fetchAll(bB)]);
+            const [dA, dB] = await Promise.all([fetchAll(bA, profileA), fetchAll(bB, profileB)]);
+
+            // Same directive stored as XAML on one side and Kinetic JSON on the
+            // other: let the server convert both to its JSON model.
+            const mixed = CompareBpm.mixedFormatPairs(dA.directives, dB.directives);
+            if (mixed.length) {
+                this._post({ command: 'status', text: `Normalizing ${mixed.length} directive(s) stored in different formats…` });
+                let next = 0, failed = 0;
+                const worker = async () => {
+                    while (next < mixed.length) {
+                        const { a, b } = mixed[next++];
+                        try {
+                            const [ja, jb] = await Promise.all([bA.getKineticDirective(a.DirectiveID), bB.getKineticDirective(b.DirectiveID)]);
+                            const ca = ja && CompareBpm.jsonToCanonical(ja), cb = jb && CompareBpm.jsonToCanonical(jb);
+                            if (!ca || !cb) { failed++; continue; }
+                            a._origFormat = CompareBpm.bodyFormat(a.Body); b._origFormat = CompareBpm.bodyFormat(b.Body);
+                            a._canon = { format: 'json', ...ca }; b._canon = { format: 'json', ...cb };
+                            a._normalized = b._normalized = true;
+                        } catch { failed++; }
+                    }
+                };
+                await Promise.all(Array.from({ length: Math.min(6, mixed.length) }, worker));
+                if (failed) warnings.push(`${failed} directive pair(s) stored as XAML vs JSON could not be normalized — they compare as raw text and will show as different.`);
+            }
+
             this._post({ command: 'status', text: 'Computing BPM diff…' });
-            const bpmData = buildBpmCompare(dA.methods, dA.directives, dB.methods, dB.directives);
+            const bpmData = CompareBpm.buildBpmCompare(dA.methods, dA.directives, dB.methods, dB.directives);
+            // Stored bodies stay host-side for the "XML" diff; the webview only
+            // gets canonical text.
+            this._bpmRawA = new Map(dA.directives.map(d => [CompareBpm.directiveKey(d), d.Body || '']));
+            this._bpmRawB = new Map(dB.directives.map(d => [CompareBpm.directiveKey(d), d.Body || '']));
+            bpmData.warnings = warnings;
             this._post({ command: 'bpmReady', data: bpmData });
         } catch (err) {
             this._post({ command: 'error', tab: 'bpm', message: err.message });
@@ -396,36 +366,11 @@ class ComparePanel {
         this._post({ command: 'status', text: 'Fetching app list…' });
         try {
             const [cA, cB] = await Promise.all([this._metafxClient(profileA, companyA), this._metafxClient(profileB, companyB)]);
+            // GetApplications(IncludeAllLayers) already embeds each app's Layers[],
+            // so the whole app + layer map is one call per environment.
             const [appsA, appsB] = await Promise.all([cA.listApps(), cB.listApps()]);
-            // Diagnostic: GetApplications is called with IncludeAllLayers:true — if
-            // the rows already embed per-app layer lists, the per-app GetLayers
-            // round-trips could be skipped entirely. Check the dev console for this.
-            const embedded = appsA[0] && Object.entries(appsA[0]).find(([, v]) =>
-                Array.isArray(v) && v.length > 0 && typeof v[0] === 'object' && v[0] !== null
-                && ('LayerName' in v[0] || 'LayerDescription' in v[0]));
-            if (embedded) console.log('[comparePanel] GetApplications embeds layers under key "' + embedded[0] + '" — GetLayers per app may be skippable');
-            const mapA = new Map(appsA.map(a => [a.Id, a]));
-            const mapB = new Map(appsB.map(a => [a.Id, a]));
-            const allIds = [...new Set([...mapA.keys(), ...mapB.keys()])].sort();
-            const apps = allIds.map(id => {
-                const a = mapA.get(id), b = mapB.get(id);
-                const inA = !!a, inB = !!b;
-                const timestampsDiffer = inA && inB && a.LastUpdated !== b.LastUpdated;
-                const status = !inA ? 'only-b' : !inB ? 'only-a' : 'in-both';
-                return { id, inA, inB, status, timestampsDiffer, lastUpdatedA: a?.LastUpdated, lastUpdatedB: b?.LastUpdated, type: (a || b).Type, subType: (a || b).SubType };
-            });
-            apps.sort((x, y) => {
-                const sc = a => a.status === 'only-a' ? 0 : a.status === 'only-b' ? 1 : a.timestampsDiffer ? 2 : 3;
-                return sc(x) - sc(y) || x.id.localeCompare(y.id);
-            });
-            const counts = { 'only-a': 0, 'only-b': 0, 'timestamps-differ': 0, 'in-both': 0 };
-            for (const a of apps) {
-                if (a.status === 'only-a') counts['only-a']++;
-                else if (a.status === 'only-b') counts['only-b']++;
-                else if (a.timestampsDiffer) counts['timestamps-differ']++;
-                else counts['in-both']++;
-            }
-            this._post({ command: 'layersReady', data: { apps, counts, total: apps.length } });
+            const data = CompareLayers.buildLayerApps(appsA, appsB, companyA === companyB);
+            this._post({ command: 'layersReady', data });
         } catch (err) {
             this._post({ command: 'error', tab: 'layers', message: err.message });
         }
@@ -448,26 +393,22 @@ class ComparePanel {
         }
     }
 
-    // Fetch layer content from both envs via GetApp (returns merged Layout/Events/DataViews/Rules)
+    // Fetch merged GetApp content for one layer from both envs, then diff it
+    // per section/item (CompareLayers) and build the wireframe trees.
     async _fetchLayerContent({ appId, layerKey, layerA, layerB, profileA, companyA, profileB, companyB }) {
         this._post({ command: 'layerContentLoading', appId, layerKey });
         try {
             const [cA, cB] = await Promise.all([this._metafxClient(profileA, companyA), this._metafxClient(profileB, companyB)]);
-            const descA = layerA?.LayerDescription || layerA?.LayerName;
-            const descB = layerB?.LayerDescription || layerB?.LayerName;
-            console.log(`[comparePanel] _fetchLayerContent appId="${appId}" layerKey="${layerKey}" descA="${descA}" descB="${descB}"`);
             // Track fetch failures separately from "this side has no layer" —
-            // conflating them made two failed fetches normalize to '' === '' and
-            // render as "✓ Identical", i.e. a silent false match.
-            const fetchSide = (client, desc, tag) => desc
-                ? client.getAppForLayer(appId, desc)
+            // conflating them made two failed fetches render as "Identical".
+            const fetchSide = (client, layer, tag) => {
+                const name = layer && (layer.LayerName || layer.LayerDescription);
+                if (!name) return Promise.resolve({ raw: null });
+                return client.getAppForLayer(appId, name, layer.DeviceType)
                     .then(raw => ({ raw }))
-                    .catch(e => { console.error(`[comparePanel] getAppForLayer ${tag} failed:`, e.message); return { raw: null, error: e.message }; })
-                : Promise.resolve({ raw: null });
-            const [resA, resB] = await Promise.all([
-                fetchSide(cA, descA, 'A'),
-                fetchSide(cB, descB, 'B'),
-            ]);
+                    .catch(e => { console.error(`[comparePanel] getAppForLayer ${tag} failed:`, e.message); return { raw: null, error: e.message }; });
+            };
+            const [resA, resB] = await Promise.all([fetchSide(cA, layerA, 'A'), fetchSide(cB, layerB, 'B')]);
             if (resA.error && resB.error) {
                 throw new Error(`Could not load layer content from either environment — ${resA.error} / ${resB.error}`);
             }
@@ -479,6 +420,12 @@ class ComparePanel {
             const toStr = v => (v ? JSON.stringify(v, null, 2) : '');
             const normA = normalizeJson(toStr(resA.raw));
             const normB = normalizeJson(toStr(resB.raw));
+            // One-sided layer: every item would be "only in X" — send counts only.
+            let sections = CompareLayers.diffAppSections(resA.raw, resB.raw);
+            if (!resA.raw || !resB.raw) sections = sections.map(s => ({ ...s, items: [] }));
+            this._post({ command: 'layerSectionsReady', appId, layerKey,
+                sections,
+                wireA: CompareLayers.buildWireframe(resA.raw), wireB: CompareLayers.buildWireframe(resB.raw) });
             this._post({ command: 'layerContentReady', appId, layerKey, normA, normB, same: normA === normB });
         } catch (err) {
             console.error(`[comparePanel] _fetchLayerContent error:`, err.message);
@@ -498,7 +445,7 @@ class ComparePanel {
         const key = `${libraryId}.${functionId}`;
 
         const confirm = await vscode.window.showWarningMessage(
-            `Apply ${key} from ${srcProfile} → ${tgtProfile}?`,
+            `Apply ${key} from ${srcProfile} -> ${tgtProfile}?`,
             { modal: true }, 'Apply'
         );
         if (confirm !== 'Apply') { this._post({ command: 'applyFnCancelled', libraryId, functionId }); return; }
@@ -519,6 +466,11 @@ class ComparePanel {
             const srcTableset = await sc.getLibrary(libraryId);
             const srcFunc = srcTableset?.EfxFunction?.find(f => f.FunctionID === functionId);
             if (!srcFunc) throw new Error(`${key} not found on ${srcProfile}`);
+            if (describeBody(srcFunc.Body).kind === 'flow') {
+                // Apply writes through the Code/Usings wrapper, which cannot carry
+                // a widget flow — sending it would overwrite the target's widgets.
+                throw new Error(`${key} is a widget-based function — apply only supports code-based functions.`);
+            }
             const { code, usings } = EpicorClient.extractCode(srcFunc.Body);
 
             this._post({ command: 'applyFnStatus', libraryId, functionId, text: `Checking ${tgtProfile}…` });
@@ -576,9 +528,9 @@ class ComparePanel {
             this._post({ command: 'applyFnDone', libraryId, functionId });
             if (sigsDiffer) {
                 vscode.window.showWarningMessage(
-                    `✓ Applied ${key} to ${tgtProfile} — but signatures still differ. Code only; edit parameters via Execute → Edit Signatures.`);
+                    `Applied ${key} to ${tgtProfile} — but signatures still differ. Code only; edit parameters via Execute -> Edit Signatures.`);
             } else {
-                vscode.window.showInformationMessage(`✓ Verified ${key} on ${tgtProfile} — code matches ${srcProfile}`);
+                vscode.window.showInformationMessage(`Verified ${key} on ${tgtProfile} — code matches ${srcProfile}`);
             }
         } catch (err) {
             this._post({ command: 'applyFnError', libraryId, functionId, message: err.message });
@@ -592,10 +544,24 @@ class ComparePanel {
                     this._post({ command: 'applyFnStatus', libraryId, functionId, text: '' });
                 } catch (e) {
                     vscode.window.showErrorMessage(
-                        `⚠ ${libraryId} on ${tgtProfile} could NOT be re-promoted and is still demoted — promote it manually. (${e.message})`);
+                        `${libraryId} on ${tgtProfile} could NOT be re-promoted and is still demoted — promote it manually. (${e.message})`);
                 }
             }
         }
+    }
+
+    // Native diff of the stored BpDirective.Body (XAML or Kinetic JSON) for one
+    // directive pair. keyA/keyB differ for a renamed directive.
+    async _openBpmRaw({ keyA, keyB, name, labelA, labelB }) {
+        const bodyA = (keyA && this._bpmRawA && this._bpmRawA.get(keyA)) || '';
+        const bodyB = (keyB && this._bpmRawB && this._bpmRawB.get(keyB)) || '';
+        const fa = CompareBpm.bodyFormat(bodyA), fb = CompareBpm.bodyFormat(bodyB);
+        const pick = f => (f === 'json' ? 'json' : f === 'xaml' ? 'xml' : null);
+        const ext = (pick(fa) && (pick(fa) === pick(fb) || fb === 'empty')) ? pick(fa) : (fa === 'empty' && pick(fb)) ? pick(fb) : 'txt';
+        await this._openNativeDiff({
+            diffId: 'raw::' + (keyA || keyB), fileName: String(name || 'directive').replace(/[^a-zA-Z0-9._-]/g, '_') + '.' + ext,
+            labelA, labelB, contentA: CompareBpm.prettyBody(bodyA), contentB: CompareBpm.prettyBody(bodyB),
+        });
     }
 
     async _openNativeDiff({ diffId, fileName, labelA, labelB, contentA, contentB }) {
@@ -621,7 +587,7 @@ class ComparePanel {
         const pathB = path.join(sideDir(labelB, 'B'), safeName);
         fs.writeFileSync(pathA, normA, 'utf8');
         fs.writeFileSync(pathB, normB, 'utf8');
-        const title = `${fileName}: ${labelA || 'A'} ↔ ${labelB || 'B'}`;
+        const title = `${fileName}: ${labelA || 'A'} vs ${labelB || 'B'}`;
         await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(pathA), vscode.Uri.file(pathB), title);
     }
 
@@ -832,6 +798,7 @@ select:focus{outline:1px solid var(--vscode-focusBorder)}
 .lib-info-toggle:hover{background:var(--vscode-list-hoverBackground)}
 .lib-info-label{font-size:11px;font-weight:700;display:flex;align-items:center;gap:6px}
 .chevron{font-size:9px;color:var(--vscode-descriptionForeground);transition:transform .15s;flex-shrink:0}
+.chevron::before{content:'';display:inline-block;border-left:5px solid currentColor;border-top:4px solid transparent;border-bottom:4px solid transparent}
 .chevron.open{transform:rotate(90deg)}
 
 /* ── Tabs (function body / lib info) ───────────────────────────────── */
@@ -937,6 +904,161 @@ select:focus{outline:1px solid var(--vscode-focusBorder)}
   padding:8px 10px;font-size:11px;white-space:pre-wrap;word-break:break-all;
   color:var(--vscode-foreground);font-family:var(--vscode-editor-font-family);
 }
+
+/* ── Compare v1 additions ───────────────────────────────────────────── */
+.filter-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.fb-chk{font-size:11px;display:inline-flex;gap:4px;align-items:center;color:var(--vscode-descriptionForeground);cursor:pointer;user-select:none}
+.tag{font-size:9px;padding:1px 5px;border-radius:2px;margin-left:5px;font-weight:600;
+  background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-family:var(--vscode-font-family);vertical-align:1px}
+.tag.warn{background:var(--c-diff-bg);color:var(--c-diff)}
+.pre-block{font-family:var(--vscode-editor-font-family);font-size:calc(var(--vscode-editor-font-size,13px) - 1px);
+  padding:10px 14px;max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.pre-block.dim{color:var(--vscode-descriptionForeground)}
+.wf-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;font-size:11px;border-bottom:1px solid var(--vscode-panel-border)}
+.wf-legend{display:inline-flex;gap:6px;align-items:center;color:var(--vscode-descriptionForeground)}
+.wf-legend i.wf-struct{border:1px dashed var(--c-diff)!important;background:none}
+.wf-legend i{display:inline-block;width:10px;height:10px;border-radius:2px;border:1px solid var(--vscode-panel-border)}
+.wf-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px}
+.wf-page{padding:6px;max-height:640px;overflow:auto;border:1px solid var(--vscode-panel-border);border-top:none}
+.wf-node{border:1px solid var(--vscode-panel-border);border-radius:3px;margin:2px;font-size:10px}
+.wf-box{display:flex;flex-wrap:wrap;align-content:flex-start;padding:3px;gap:2px}
+.wf-box>.wf-lbl{width:100%;font-weight:700;font-size:9px;color:var(--vscode-descriptionForeground);padding:1px 3px}
+.wf-leaf{padding:3px 6px;min-width:110px;flex:1 1 130px;border-style:dashed}
+.wf-type{opacity:.5;font-size:9px;font-family:var(--vscode-editor-font-family)}
+.wf-bind{display:block;opacity:.6;font-size:9px;font-family:var(--vscode-editor-font-family);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wf-changed{background:var(--c-diff-bg)!important;border-color:var(--c-diff)!important}
+.wf-only-a{background:var(--c-only-a-bg)!important;border-color:var(--c-only-a)!important}
+.wf-only-b{background:var(--c-only-b-bg)!important;border-color:var(--c-only-b)!important}
+.bf-wrap{overflow:auto;max-height:560px;border:1px solid var(--vscode-panel-border);border-top:none;padding:4px}
+.bf-svg{display:block}
+.bf-node rect{fill:var(--vscode-editor-background);stroke:var(--vscode-descriptionForeground);stroke-width:1}
+.bf-condition rect{stroke-dasharray:4 2}
+.bf-changed rect{stroke:#e0ac00;stroke-width:2}
+.bf-del rect{stroke:#e0ac00;stroke-width:2;stroke-dasharray:5 3}
+.bf-only-a rect{fill:var(--c-only-a-bg);stroke:var(--c-only-a);stroke-width:2}
+.bf-only-b rect{fill:var(--c-only-b-bg);stroke:var(--c-only-b);stroke-width:2}
+.bf-t1{font-size:11px;font-weight:700;fill:var(--vscode-foreground);font-family:var(--vscode-font-family)}
+.bf-t2{font-size:10px;fill:var(--vscode-descriptionForeground);font-family:var(--vscode-font-family)}
+.bf-edge{fill:none;stroke:var(--vscode-descriptionForeground);stroke-width:1.2}
+.bf-arrow{fill:var(--vscode-descriptionForeground)}
+.bf-elbl{font-size:9px;fill:var(--vscode-descriptionForeground);font-family:var(--vscode-font-family)}
+.bf-node{cursor:help}
+/* ── Kinetic-style preview ──────────────────────────────────────────────────
+   Values follow Kinetic's own component rules (main.js component styles) and
+   palette variables; --interactive is the CPI override sampled from a live page. */
+.kin-single{padding:8px}
+.kin-col-wrap{min-width:0}
+.kin-canvas{--base:#f0f3f5;--interactive:#316b9c;--interactive-44:#3f86c0;--interactive-24:#244f73;--neutral:#fff;--neutral-20:#333;
+  --neutral-38:#616161;--neutral-80:#ccc;--neutral-95:#f2f2f2;--nothing:#000;--primary-2485:#d2dee1;--primary-3468:#9bbdc8;
+  --primary-2491:#e4ebed;--primary-3495:#eff5f6;--success-4566:#6db7ab;--warning:#ffe199;--error-91:#ffd6d1;
+  background:var(--base);color:var(--nothing);font-family:"Source Sans Pro","Source Sans 3","Segoe UI",-apple-system,Helvetica,Arial,sans-serif;
+  font-size:12px;padding:14px 16px;max-height:760px;overflow:auto;border:1px solid var(--vscode-panel-border);border-top:none}
+.kin-canvas *{box-sizing:border-box}
+/* ep-panel-card */
+.kin-card{background:var(--primary-2485);border:1px solid var(--primary-3468);border-radius:3px;margin:0 0 10px}
+.kin-card-hdr{display:flex;align-items:center;justify-content:space-between;position:relative;padding:4px 15px 4px 50px;min-height:50px;border-bottom:1px solid var(--primary-3468)}
+.kin-card.kin-collapsed-card .kin-card-hdr{border-bottom:none}
+.kin-chev{position:absolute;left:20px;top:50%;transform:translateY(-50%);color:var(--interactive);display:flex;width:18px}
+.kin-chev.kin-collapsed{transform:translateY(-50%) rotate(180deg)}
+.kin-card-title{font-size:18px;font-weight:600;line-height:24px;white-space:nowrap;color:var(--nothing)}
+.kin-card-hdr-items{display:flex;gap:10px;align-items:center;flex-wrap:wrap;flex:1;justify-content:flex-end;margin-left:16px}
+.kin-card-body{padding:20px 20px 0}
+.kin-card-grid{padding:0}
+.kin-fullscreen{display:flex;justify-content:center}
+.kin-fullscreen span{background:var(--primary-3468);color:var(--neutral-20);font-size:14px;padding:2px 18px;display:inline-flex;gap:8px;align-items:center}
+.kin-ic{width:16px;height:16px;display:block}
+/* metafx-div / metafx-col: rows never wrap, 15px gutters, 30px under a row */
+.kin-div{min-width:0}
+.kin-row{display:flex;flex-wrap:nowrap;justify-content:flex-start;align-items:stretch;margin:0 -15px 30px}
+.kin-col .kin-row:last-child, .kin-card-body>.kin-div:last-child>.kin-row{margin-bottom:10px}
+.kin-col{flex:0 1 auto;min-width:0;padding:0 15px}
+.kin-group-lbl{display:block;font-size:14px;color:var(--neutral-20);padding-top:5px;margin-bottom:10px;font-weight:400}
+.kin-flex{display:flex;flex-wrap:wrap;gap:0 20px;align-items:flex-start}
+.kin-flex>*{flex:1 1 180px;min-width:150px}
+/* ep-text-box family (kendo floating label) */
+.kin-field{margin:0 0 10px}
+.kin-multi{display:flex;gap:10px}
+.kin-multi>.kin-input{flex:1}
+.kin-multi>.kin-narrow{flex:0 0 90px}
+.kin-input{position:relative;background:var(--neutral);height:40px;padding:3px 40px 0 10px;box-shadow:0 1px 0 0 var(--interactive)}
+.kin-input.kin-ro{background:var(--neutral-95);box-shadow:0 1px 0 0 var(--neutral-80)}
+.kin-input.kin-area{height:auto;min-height:132px;background:var(--neutral-95);box-shadow:none;border:1px solid #dfdfdf}
+.kin-flabel{font-size:12px;color:var(--neutral-38);line-height:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kin-req{margin-left:3px}
+.kin-val{font-size:14px;line-height:19px;min-height:19px;display:flex;justify-content:space-between;gap:6px;overflow:hidden}
+.kin-bind{color:#8a96a3;font-size:12px;font-style:italic;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kin-num{margin-left:auto}
+.kin-icon{position:absolute;right:10px;top:50%;transform:translateY(-50%);color:var(--interactive);display:flex;align-items:center;gap:4px}
+.kin-ro .kin-icon{color:var(--neutral-38)}
+.kin-navtxt{font-size:12px;white-space:nowrap;color:var(--neutral-38)}
+.kin-rownav .kin-input{padding-right:100px}
+/* ep-check-box */
+.kin-check{position:relative;display:flex;align-items:center;min-height:24px;margin:5px 16px 5px 0}
+.kin-cb{width:18px;height:18px;border:2px solid var(--interactive);border-radius:2px;background:var(--neutral);flex-shrink:0}
+.kin-cb.kin-ro{border-color:var(--neutral-38)}
+.kin-cb-lbl{font-size:14px;margin-left:7px;color:var(--neutral-20)}
+.kin-cb.kin-ro + .kin-cb-lbl{color:var(--neutral-38)}
+.kin-radios{display:flex;gap:16px;flex-wrap:wrap}
+.kin-radio{display:inline-flex;align-items:center;gap:7px;font-size:14px;color:var(--neutral-20)}
+.kin-rb{width:18px;height:18px;border:2px solid var(--interactive);border-radius:50%;display:inline-block;background:var(--neutral)}
+.kin-rb-on{box-shadow:inset 0 0 0 3px var(--neutral);background:var(--interactive)}
+/* ep-button (primary) */
+.kin-btn{display:inline-flex;align-items:center;justify-content:center;background:var(--interactive);color:var(--neutral);font-size:14px;padding:6px 18px;white-space:nowrap;margin:5px 10px 5px 5px}
+.kin-card-hdr .kin-btn{margin:0}
+/* erp-shape / erp-tag */
+.kin-shape{display:inline-flex;align-items:center;gap:8px;border:2px solid var(--interactive);border-radius:5px;background:var(--success-4566);min-height:20px;padding:2px 10px 2px 6px;margin:5px 0}
+.kin-shape-lbl{font-size:14px;font-weight:600;color:var(--nothing);white-space:nowrap}
+.kin-shape::before{content:'';width:16px;height:16px;background:var(--neutral);border:2px solid var(--interactive);border-radius:2px;flex-shrink:0}
+.kin-shape-warn{background:var(--warning)}
+.kin-shape-err{background:var(--error-91)}
+.kin-card-hdr .kin-shape{margin:0}
+.kin-label{font-size:14px;padding:4px 0 8px;color:var(--neutral-20)}
+/* ep-grid */
+.kin-grid-tools{display:flex;align-items:center;gap:14px;padding:6px 20px;color:var(--interactive)}
+.kin-gsearch{display:flex;align-items:center;gap:6px;background:var(--neutral);box-shadow:0 1px 0 0 var(--interactive);padding:4px 8px;min-width:170px;font-size:13px;color:var(--neutral-38)}
+.kin-grid-scroll{overflow:auto}
+.kin-grid{border-collapse:collapse;width:100%;font-size:14px}
+.kin-grid th{background:var(--primary-2491);font-weight:600;text-align:left;padding:10px 8px;border-top:1px solid var(--primary-3468);border-bottom:1px solid var(--neutral-80);border-right:1px solid var(--neutral-80);white-space:nowrap}
+.kin-grid td{height:24px;background:var(--neutral);border-bottom:1px solid var(--neutral-80);border-right:1px solid var(--neutral-80)}
+.kin-grid tr:nth-child(even) td{background:var(--primary-3495)}
+.kin-grid .kin-gsel{width:20px;padding:0}
+.kin-grid-foot{font-size:11px;color:#8a96a3;font-style:italic;padding:4px 20px}
+/* metafx-tabstrip (page tabs as rendered on the live page) */
+.kin-tabstrip{margin:0 0 10px}
+.kin-tabs{display:flex;gap:8px;margin:0 0 14px;align-items:center}
+.kin-tab{padding:8px 16px;font-size:14px;color:var(--interactive);cursor:pointer;border:1px solid transparent;border-radius:3px}
+.kin-tab:hover{color:var(--interactive-44)}
+.kin-tab-on{color:var(--nothing);background:var(--neutral);border-color:#858585}
+.kin-stack>.kin-card{margin-bottom:10px}
+.kin-unknown{border:1px dashed #9aa8b0;padding:6px 8px;margin:0 0 10px;background:rgba(255,255,255,.45)}
+.kin-unknown-lbl{font-size:13px;color:var(--neutral-38)}
+.kin-unknown-lbl span{font-size:11px;opacity:.7;font-family:var(--vscode-editor-font-family)}
+.kin-empty{color:var(--neutral-38);font-style:italic;padding:16px;font-size:13px}
+.kin-hidden{opacity:.45;outline:1px dashed #8a96a3;outline-offset:1px}
+/* diff overlay: yellow border on the changed control only (B side); dashed on A for deleted. No tints. */
+.kin-ch{outline:2px solid #e0ac00!important;outline-offset:1px}
+.kin-del{outline:2px dashed #e0ac00!important;outline-offset:1px}
+.kin-side{background:var(--vscode-sideBarSectionHeader-background,rgba(255,255,255,.04));color:var(--vscode-foreground)}
+.wf-legend i.kin-lg-ch{border:2px solid #e0ac00!important;background:none}
+.wf-legend i.kin-lg-del{border:2px dashed #e0ac00!important;background:none}
+.kin-viewsw{display:inline-flex;border:1px solid var(--vscode-panel-border);border-radius:3px;overflow:hidden}
+.kin-vs{padding:2px 10px;cursor:pointer;font-size:11px;color:var(--vscode-descriptionForeground)}
+.kin-vs.on{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+
+.bf-start rect{fill:var(--vscode-badge-background);stroke:var(--vscode-descriptionForeground)}
+.fn-row.open > .fn-row-hdr .chevron{transform:rotate(90deg)}
+
+/* ── One colour for all text/badges. The only colour in the panel is the yellow
+   border on changed controls/nodes in Preview and Flow (plus line-diff backgrounds). ── */
+.fn-badge,.list-badge,.tag,.tag.warn,.tab-badge,.type-tab.active .tab-badge,.chip-count{background:var(--vscode-badge-background)!important;color:var(--vscode-badge-foreground)!important}
+.list-dot{background:var(--vscode-descriptionForeground)!important;opacity:.6}
+.chip.active{border-bottom-color:var(--vscode-button-background)!important}
+.env-label.a,.env-label.b{color:var(--vscode-descriptionForeground)!important}
+.diff-col-hdr.a,.diff-col-hdr.b{background:var(--vscode-sideBarSectionHeader-background,rgba(255,255,255,.04))!important;color:var(--vscode-foreground)!important}
+.section-lbl,.detail-meta span,.fn-changed,.only-info,.list-delta{color:var(--vscode-descriptionForeground)!important}
+.meta-tbl tr.changed td{background:none!important}
+.meta-tbl tr.changed td:first-child{font-weight:700}
+.va,.vb,.vs{color:inherit!important}
 </style>
 </head>
 <body>
@@ -956,7 +1078,7 @@ select:focus{outline:1px solid var(--vscode-focusBorder)}
       <select id="profileB" onchange="onProfileChange('B')"><option value="">— profile —</option></select>
       <select id="companyB"><option value="">— company —</option></select>
     </div>
-    <button class="run-btn" id="runBtn" onclick="runCompare()">▶ Run Compare</button>
+    <button class="run-btn" id="runBtn" onclick="runCompare()">Run Compare</button>
   </div>
 </div>
 <div class="status-bar" id="statusBar"></div>
@@ -988,11 +1110,16 @@ select:focus{outline:1px solid var(--vscode-focusBorder)}
 <div class="type-pane" id="pane-bpm">
   <div class="load-prompt" id="bpmPrompt">
     <button onclick="loadBpm()">Load BPM Compare</button>
-    <span>Fetches all directive code from both environments</span>
+    <span>Method + data directives, widgets and code, from both environments</span>
   </div>
   <div style="display:none;flex-direction:column;flex:1;overflow:hidden" id="bpmMain">
     <div class="summary" id="bpmSummary"></div>
-    <div class="filter-bar"><input class="search" id="bpmSearch" placeholder="Search services…" oninput="bpmApply()"></div>
+    <div class="filter-bar">
+      <input class="search" id="bpmSearch" placeholder="Search services / methods / directives…" oninput="bpmApply()">
+      <select id="bpmSource" onchange="bpmApply()"><option value="">All sources</option><option value="BO">Method directives</option><option value="DB">Data directives</option></select>
+      <label class="fb-chk"><input type="checkbox" id="bpmHideDisabled" onchange="bpmApply()"> Hide disabled</label>
+      <label class="fb-chk"><input type="checkbox" id="bpmCodeOnly" onchange="bpmApply()"> Code changes only</label>
+    </div>
     <div class="split-grid">
       <div class="list-col" id="bpmList"></div>
       <div class="detail-col" id="bpmDetail"><div class="empty-state"><span>Select a service</span></div></div>
@@ -1004,11 +1131,11 @@ select:focus{outline:1px solid var(--vscode-focusBorder)}
 <div class="type-pane" id="pane-layers">
   <div class="load-prompt" id="layersPrompt">
     <button onclick="loadLayers()">Load Layers Compare</button>
-    <span>Fetches app list — detail loads on click</span>
+    <span>Custom layers only (system/base excluded) — content loads per layer on click</span>
   </div>
   <div style="display:none;flex-direction:column;flex:1;overflow:hidden" id="layersMain">
     <div class="summary" id="layersSummary"></div>
-    <div class="filter-bar"><input class="search" id="layersSearch" placeholder="Search apps…" oninput="layersApply()"></div>
+    <div class="filter-bar"><input class="search" id="layersSearch" placeholder="Search apps / layers…" oninput="layersApply()"></div>
     <div class="split-grid">
       <div class="list-col" id="layersList"></div>
       <div class="detail-col" id="layersDetail"><div class="empty-state"><span>Select an app to diff</span></div></div>
@@ -1157,7 +1284,7 @@ function runCompare() {
   const profileB = document.getElementById('profileB').value;
   const companyB = document.getElementById('companyB').value;
   if (!profileA || !companyA || !profileB || !companyB) {
-    setStatus('⚠ Select both profiles and companies before running');
+    setStatus('Select both profiles and companies before running');
     return;
   }
   LAST_RUN = { profileA, companyA, profileB, companyB };
@@ -1175,7 +1302,7 @@ function runCompare() {
 }
 
 function loadBpm() {
-  if (!LAST_RUN) { setStatus('⚠ Run a compare first'); return; }
+  if (!LAST_RUN) { setStatus('Run a compare first'); return; }
   if (BPM_LOADED || BPM_LOADING) return;
   BPM_LOADING = true;
   document.getElementById('bpmPrompt').style.display = 'none';
@@ -1186,7 +1313,7 @@ function loadBpm() {
 }
 
 function loadLayers() {
-  if (!LAST_RUN) { setStatus('⚠ Run a compare first'); return; }
+  if (!LAST_RUN) { setStatus('Run a compare first'); return; }
   if (LY_LOADED || LY_LOADING) return;
   LY_LOADING = true;
   document.getElementById('layersPrompt').style.display = 'none';
@@ -1284,7 +1411,7 @@ window.addEventListener('message', ({ data: msg }) => {
       setStatus('');
       break;
     case 'applyFnDone':
-      setStatus(\`✓ Applied \${msg.functionId} — re-run compare to refresh this view\`);
+      setStatus(\`Applied \${msg.functionId} — re-run compare to refresh this view\`);
       break;
     case 'applyFnError':
       setStatus('Apply failed: ' + msg.message);
@@ -1335,7 +1462,7 @@ function fnApply() {
         return \`<div class="list-item s-\${l.status} \${l.libID===FN_SEL?'active':''}" onclick="fnSelect('\${jsAttr(l.libID)}')">
           <div class="list-dot"></div>
           <span class="list-name" title="\${esc(l.libID)}">\${esc(l.libID)}</span>
-          \${delta ? \`<span class="list-delta">\${delta}Δ</span>\` : ''}
+          \${delta ? \`<span class="list-delta">\${delta} diff</span>\` : ''}
           <span class="list-badge">\${lm[l.status]||l.status}</span>
         </div>\`;
       }).join('')
@@ -1351,14 +1478,14 @@ function fnSelect(libID) {
 function renderFnDetail(lib) {
   const ea = FN_DATA.meta.env_a_name, eb = FN_DATA.meta.env_b_name;
   const sc = { match:'var(--c-match)', diff:'var(--c-diff)', 'only-a':'var(--c-only-a)', 'only-b':'var(--c-only-b)' };
-  const sl = { match:'✓ Match', diff:'~ Different', 'only-a':\`✗ Only in \${ea}\`, 'only-b':\`+ Only in \${eb}\` };
+  const sl = { match:'Match', diff:'~ Different', 'only-a':\`Only in \${ea}\`, 'only-b':\`+ Only in \${eb}\` };
   let html = \`<div class="detail-hdr">
     <div class="detail-title">\${esc(lib.libID)}</div>
     <div class="detail-meta">
       <span style="color:\${sc[lib.status]}">\${sl[lib.status]}</span>
-      <span>│ \${lib.fnDiffs.length} function\${lib.fnDiffs.length!==1?'s':''}</span>
-      <span style="color:\${lib.inA?'var(--c-only-a)':'var(--vscode-descriptionForeground)'}">● \${ea}</span>
-      <span style="color:\${lib.inB?'var(--c-only-b)':'var(--vscode-descriptionForeground)'}">● \${eb}</span>
+      <span>| \${lib.fnDiffs.length} function\${lib.fnDiffs.length!==1?'s':''}</span>
+      <span style="color:\${lib.inA?'var(--c-only-a)':'var(--vscode-descriptionForeground)'}">\${ea}</span>
+      <span style="color:\${lib.inB?'var(--c-only-b)':'var(--vscode-descriptionForeground)'}">\${eb}</span>
     </div>
   </div>\`;
   html += renderLibInfoPanel(lib, ea, eb);
@@ -1387,15 +1514,15 @@ function renderLibInfoPanel(lib, ea, eb) {
   let html = \`<div class="lib-info-wrap">
     <div class="lib-info-toggle" onclick="toggleEl('\${lid}','\${lid}_chev')">
       <span class="lib-info-label">
-        \${hasDiff ? '⚡' : '📋'} Library Info
+        Library Info\${hasDiff ? ' *' : ''}
         \${hasDiff ? \`<span style="color:var(--c-diff);font-size:9px">has differences</span>\` : \`<span style="color:var(--vscode-descriptionForeground);font-size:9px">click to expand</span>\`}
       </span>
-      <span class="chevron \${hasDiff?'open':''}" id="\${lid}_chev">▶</span>
+      <span class="chevron \${hasDiff?'open':''}" id="\${lid}_chev"></span>
     </div>
     <div id="\${lid}" style="display:\${hasDiff?'block':'none'};border-top:1px solid var(--vscode-panel-border)">
       <div class="tabs">
-        <button class="tab active" onclick="switchLibTab(this,'\${lid}','refs')">References\${refsDiff?' ⚡':''}</button>
-        <button class="tab"        onclick="switchLibTab(this,'\${lid}','settings')">Settings\${metaDiff?' ⚡':''}</button>
+        <button class="tab active" onclick="switchLibTab(this,'\${lid}','refs')">References\${refsDiff?' *':''}</button>
+        <button class="tab"        onclick="switchLibTab(this,'\${lid}','settings')">Settings\${metaDiff?' *':''}</button>
         <button class="tab"        onclick="switchLibTab(this,'\${lid}','info')">Info</button>
       </div>\`;
 
@@ -1408,11 +1535,11 @@ function renderLibInfoPanel(lib, ea, eb) {
       const sid = \`\${lid}_\${k}\`;
       html += \`<div class="ref-group"><div class="ref-group-hdr" onclick="toggleEl('\${sid}','\${sid}_chev')">
         <span class="ref-group-lbl">\${k}</span>
-        <span style="font-size:9px;color:var(--c-match)">✓ match (\${items.length})</span>
-        <span class="chevron" id="\${sid}_chev">▶</span></div>
+        <span style="font-size:9px;color:var(--c-match)">match (\${items.length})</span>
+        <span class="chevron" id="\${sid}_chev"></span></div>
         <div id="\${sid}" style="display:none"><table class="meta-tbl"><tbody>\${items.map(i=>\`<tr><td colspan="2" class="vs">\${esc(i)}</td></tr>\`).join('')}</tbody></table></div></div>\`;
     } else {
-      html += \`<div class="ref-group"><div class="ref-group-hdr"><span class="ref-group-lbl">\${k}</span><span style="font-size:9px;color:var(--c-diff)">⚡ different</span></div>\${inlineListDiff(v.a,v.b,ea,eb)}</div>\`;
+      html += \`<div class="ref-group"><div class="ref-group-hdr"><span class="ref-group-lbl">\${k}</span><span style="font-size:9px;color:var(--c-diff)"> * different</span></div>\${inlineListDiff(v.a,v.b,ea,eb)}</div>\`;
     }
   }
   html += '</div>';
@@ -1442,17 +1569,17 @@ function renderFnRow(fn, libID, ea, eb) {
   // existing function row, so only-in-one-environment functions are excluded
   // (they need creating on the target first), as are already-matching ones.
   const applyBtns = fn.status === 'diff'
-    ? \`<button class="open-diff-btn" title="Copy this function's code to \${esc(eb)}" onclick="event.stopPropagation();applyFn('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}','aToB')">→ \${esc(eb)}</button>\`
-      + \`<button class="open-diff-btn" title="Copy this function's code to \${esc(ea)}" onclick="event.stopPropagation();applyFn('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}','bToA')">→ \${esc(ea)}</button>\`
+    ? \`<button class="open-diff-btn" title="Copy this function's code to \${esc(eb)}" onclick="event.stopPropagation();applyFn('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}','aToB')">-> \${esc(eb)}</button>\`
+      + \`<button class="open-diff-btn" title="Copy this function's code to \${esc(ea)}" onclick="event.stopPropagation();applyFn('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}','bToA')">-> \${esc(ea)}</button>\`
     : '';
   return \`<div class="fn-row" id="\${id}">
     <div class="fn-row-hdr" onclick="toggleFn('\${id}')">
       <span class="fn-badge" style="background:\${sc[fn.status]}22;color:\${sc[fn.status]}">\${sb[fn.status]}</span>
       <span class="fn-name">\${esc(fn.fnID)}</span>
       \${changed.length?\`<span class="fn-changed">\${changed.join(', ')}</span>\`:''}
-      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openFnDiff('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}')">↗ Diff</button>
+      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openFnDiff('\${jsAttr(libID)}','\${jsAttr(fn.fnID)}')">Diff</button>
       \${applyBtns}
-      <span class="chevron">▶</span>
+      <span class="chevron"></span>
     </div>
     <div class="fn-body">\${renderFnBody(fn, ea, eb)}</div>
   </div>\`;
@@ -1492,9 +1619,9 @@ function renderFnBody(fn, ea, eb) {
   const sigDiff  = !fn.fields?.Inputs?.same || !fn.fields?.Outputs?.same;
   const metaDiff = ['Description','Kind','RequireTransaction','SingleRowMode','Private','Disabled'].some(k=>fn.fields?.[k]&&!fn.fields[k].same);
   return \`<div class="tabs">
-    <button class="tab active" onclick="switchFnTab(this,'\${fid}','code')">Code\${codeDiff?' ⚡':''}</button>
-    <button class="tab"        onclick="switchFnTab(this,'\${fid}','sig')">Signature\${sigDiff?' ⚡':''}</button>
-    <button class="tab"        onclick="switchFnTab(this,'\${fid}','meta')">Metadata\${metaDiff?' ⚡':''}</button>
+    <button class="tab active" onclick="switchFnTab(this,'\${fid}','code')">Code\${codeDiff?' *':''}</button>
+    <button class="tab"        onclick="switchFnTab(this,'\${fid}','sig')">Signature\${sigDiff?' *':''}</button>
+    <button class="tab"        onclick="switchFnTab(this,'\${fid}','meta')">Metadata\${metaDiff?' *':''}</button>
   </div>
   <div class="pane active" data-fn="\${fid}" data-tab="code">
     \${sideBySide(fn.fields?.Code?.a||'',fn.fields?.Code?.b||'',ea,eb)}
@@ -1528,284 +1655,6 @@ function renderMetaPane(fn, ea, eb) {
   }</tbody></table>\`;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// BPM TAB
-// ═══════════════════════════════════════════════════════════════════════
-
-function renderBpmSummary() {
-  const c = BPM_DATA.counts;
-  document.getElementById('bpmSummary').innerHTML =
-    chip('all',   'chip-all',   'All',       'bpmFilter', BPM_DATA.total) +
-    chip('match', 'chip-match', 'Match',     'bpmFilter', c.match||0) +
-    chip('diff',  'chip-diff',  'Different', 'bpmFilter', c.diff||0);
-}
-function bpmFilter(f, el) { BPM_FILTER = f; document.querySelectorAll('[data-chip="bpmFilter"]').forEach(c=>c.classList.remove('active')); el.classList.add('active'); bpmApply(); }
-function bpmApply() {
-  if (!BPM_DATA) return;
-  const q = (document.getElementById('bpmSearch').value||'').toLowerCase();
-  const items = BPM_DATA.services.filter(s => (BPM_FILTER==='all'||s.status===BPM_FILTER)&&(!q||s.businessObject.toLowerCase().includes(q)));
-  document.getElementById('bpmList').innerHTML = items.length
-    ? items.map(s => \`<div class="list-item s-\${s.status} \${s.svcKey===BPM_SEL?'active':''}" onclick="bpmSelect('\${jsAttr(s.svcKey)}')">
-        <div class="list-dot"></div>
-        <span class="list-name" title="\${esc(s.svcKey)}">\${esc(s.businessObject)}</span>
-        \${s.diffCount?\`<span class="list-delta">\${s.diffCount}Δ</span>\`:''}
-        <span class="list-badge">\${s.status.toUpperCase()}</span>
-      </div>\`).join('')
-    : '<div class="no-results">No services match</div>';
-}
-function bpmSelect(svcKey) {
-  BPM_SEL = svcKey;
-  document.querySelectorAll('#bpmList .list-item').forEach(el=>el.classList.toggle('active', el.querySelector('.list-name')?.title===svcKey));
-  const svc = BPM_DATA.services.find(s=>s.svcKey===svcKey);
-  if (svc) renderBpmDetail(svc);
-}
-
-function renderBpmDetail(svc) {
-  const ea = LAST_RUN.profileA, eb = LAST_RUN.profileB;
-  const sc = { match:'var(--c-match)', diff:'var(--c-diff)', 'only-a':'var(--c-only-a)', 'only-b':'var(--c-only-b)' };
-  let html = \`<div class="detail-hdr">
-    <div class="detail-title">\${esc(svc.businessObject)}</div>
-    <div class="detail-meta">
-      <span style="color:\${sc[svc.status]}">\${svc.status}</span>
-      <span>│ \${svc.methods.length} method\${svc.methods.length!==1?'s':''}</span>
-      <span>\${svc.systemCode}</span>
-    </div>
-  </div><div class="fn-section">\`;
-
-  const groups = [{k:'diff',l:'Different',c:'var(--c-diff)'},{k:'only-a',l:\`Only in \${ea}\`,c:'var(--c-only-a)'},{k:'only-b',l:\`Only in \${eb}\`,c:'var(--c-only-b)'},{k:'match',l:'Matching',c:'var(--c-match)'}];
-  for (const g of groups) {
-    const methods = svc.methods.filter(m => m.status === g.k);
-    if (!methods.length) continue;
-    html += \`<div class="section-lbl" style="color:\${g.c}">\${g.l} (\${methods.length})</div>\`;
-    for (const m of methods) {
-      html += \`<div style="padding:4px 0 2px;font-size:10px;font-weight:700;color:var(--vscode-descriptionForeground);font-family:var(--vscode-editor-font-family);margin-top:6px">\${esc(m.methodName)}</div>\`;
-      for (const dir of m.dirDiffs) html += renderBpmDirRow(dir, m.methodCode, ea, eb);
-    }
-  }
-  html += '</div>';
-  document.getElementById('bpmDetail').innerHTML = html;
-}
-
-function renderBpmDirRow(dir, methodCode, ea, eb) {
-  const sc = { match:'var(--c-match)', diff:'var(--c-diff)', 'only-a':'var(--c-only-a)', 'only-b':'var(--c-only-b)' };
-  const sb = { match:'MATCH', diff:'DIFF', 'only-a': ea, 'only-b': eb };
-  const id = 'bpm_' + CSS.escape(methodCode + '_' + dir.name);
-  const typeLabel = { 1:'Pre', 2:'Base', 3:'Post' };
-  const dirType = typeLabel[(dir.da||dir.db)?.DirectiveType] || '';
-  const changed = dir.fields ? Object.entries(dir.fields).filter(([k,v])=>k!=='hasDiff'&&typeof v==='object'&&!v.same).map(([k])=>k) : [];
-  return \`<div class="fn-row" id="\${id}">
-    <div class="fn-row-hdr" onclick="toggleFn('\${id}')">
-      <span class="fn-badge" style="background:\${sc[dir.status]}22;color:\${sc[dir.status]}">\${sb[dir.status]}</span>
-      <span class="fn-name">\${esc(dir.name)}\${dirType?\` <span style="opacity:.5;font-size:10px">[\${dirType}]</span>\`:''}</span>
-      \${changed.length?\`<span class="fn-changed">\${changed.join(', ')}</span>\`:''}
-      <button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openBpmDirDiff('\${jsAttr(methodCode)}','\${jsAttr(dir.name)}')">↗ Diff</button>
-      <span class="chevron">▶</span>
-    </div>
-    <div class="fn-body">\${renderBpmDirBody(dir, ea, eb)}</div>
-  </div>\`;
-}
-
-function renderBpmDirBody(dir, ea, eb) {
-  if (dir.status === 'only-a' || dir.status === 'only-b') {
-    const d = dir.da || dir.db, env = dir.status==='only-a'?ea:eb;
-    const envColor = dir.status==='only-a'?'var(--c-only-a)':'var(--c-only-b)';
-    return \`<div style="padding:4px 12px;font-size:9px;color:\${envColor};border-bottom:1px solid var(--vscode-panel-border)">Only in \${env}</div>
-      \${d?.hasCode?\`<div style="font-family:var(--vscode-editor-font-family);font-size:calc(var(--vscode-editor-font-size,13px)-1px);padding:10px 14px;max-height:360px;overflow-y:auto;white-space:pre-wrap;word-break:break-all">\${esc(d._code||'')}</div>\`:'<div class="only-info">No custom C# code</div>'}\`;
-  }
-  if (dir.status === 'match') {
-    const code = dir.da?._code || '';
-    return \`<div style="font-family:var(--vscode-editor-font-family);font-size:calc(var(--vscode-editor-font-size,13px)-1px);padding:10px 14px;max-height:360px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--vscode-descriptionForeground)">\${esc(code||'(no custom code)')}</div>\`;
-  }
-  const fid = esc(dir.name);
-  const codeDiff = dir.fields?.Code && !dir.fields.Code.same;
-  const xamlDiff = dir.fields?.Xaml && !dir.fields.Xaml.same;
-  const metaDiff = ['DirectiveType','IsEnabled','Sequence'].some(k=>dir.fields?.[k]&&!dir.fields[k].same);
-  return \`<div class="tabs">
-    <button class="tab active" onclick="switchFnTab(this,'\${fid}','code')">Code\${codeDiff?' ⚡':''}</button>
-    \${xamlDiff?\`<button class="tab" onclick="switchFnTab(this,'\${fid}','xaml')">Widgets ⚡</button>\`:''}
-    <button class="tab"        onclick="switchFnTab(this,'\${fid}','meta')">Settings\${metaDiff?' ⚡':''}</button>
-  </div>
-  <div class="pane active" data-fn="\${fid}" data-tab="code">\${sideBySide(dir.fields?.Code?.a||'',dir.fields?.Code?.b||'',ea,eb)}</div>
-  \${xamlDiff?\`<div class="pane" data-fn="\${fid}" data-tab="xaml">\${sideBySide(dir.fields.Xaml.a||'',dir.fields.Xaml.b||'',ea,eb)}</div>\`:''}
-  <div class="pane" data-fn="\${fid}" data-tab="meta">
-    <table class="meta-tbl"><thead><tr><th>Field</th><th style="color:var(--c-only-a)">\${ea}</th><th style="color:var(--c-only-b)">\${eb}</th></tr></thead><tbody>\${
-      ['DirectiveType','IsEnabled','Sequence'].map(k=>{ const f=dir.fields?.[k]; if(!f) return '';
-        return \`<tr \${!f.same?'class="changed"':''}><td>\${k}</td><td class="\${f.same?'vs':'va'}">\${esc(f.a||'—')}</td><td class="\${f.same?'vs':'vb'}">\${esc(f.b||'—')}</td></tr>\`;
-      }).join('')
-    }</tbody></table>
-  </div>\`;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// LAYERS TAB
-// ═══════════════════════════════════════════════════════════════════════
-
-function renderLayersSummary() {
-  const c = LY_DATA.counts;
-  document.getElementById('layersSummary').innerHTML =
-    chip('all',               'chip-all',   'All',              'lyFilter', LY_DATA.total) +
-    chip('only-a',            'chip-only-a', \`Only in \${LAST_RUN?.profileA||'A'}\`, 'lyFilter', c['only-a']) +
-    chip('only-b',            'chip-only-b', \`Only in \${LAST_RUN?.profileB||'B'}\`, 'lyFilter', c['only-b']) +
-    chip('timestamps-differ', 'chip-diff',  'Timestamps Differ','lyFilter', c['timestamps-differ']) +
-    chip('in-both',           'chip-match', 'Matching',         'lyFilter', c['in-both']);
-}
-function lyFilter(f, el) { LY_FILTER = f; document.querySelectorAll('[data-chip="lyFilter"]').forEach(c=>c.classList.remove('active')); el.classList.add('active'); layersApply(); }
-function layersApply() {
-  if (!LY_DATA) return;
-  const q = (document.getElementById('layersSearch').value||'').toLowerCase();
-  const items = LY_DATA.apps.filter(a => {
-    if (LY_FILTER !== 'all') {
-      if (LY_FILTER === 'timestamps-differ' && !(a.status==='in-both'&&a.timestampsDiffer)) return false;
-      if (LY_FILTER === 'in-both' && !(a.status==='in-both'&&!a.timestampsDiffer)) return false;
-      if (LY_FILTER !== 'timestamps-differ' && LY_FILTER !== 'in-both' && a.status !== LY_FILTER) return false;
-    }
-    return !q || a.id.toLowerCase().includes(q);
-  });
-  document.getElementById('layersList').innerHTML = items.length
-    ? items.map(a => {
-        const cls = a.status!=='in-both' ? \`s-\${a.status}\` : a.timestampsDiffer ? 's-ts-diff' : 's-in-both';
-        const badge = a.status==='only-a'?LAST_RUN.profileA : a.status==='only-b'?LAST_RUN.profileB : a.timestampsDiffer?'⏱ DIFFER':'MATCH';
-        return \`<div class="list-item \${cls} \${a.id===LY_SEL?'active':''}" onclick="layersSelect('\${jsAttr(a.id)}')">
-          <div class="list-dot"></div>
-          <span class="list-name" title="\${esc(a.id)}">\${esc(a.id)}</span>
-          \${a.subType?\`<span class="list-delta">\${esc(a.subType)}</span>\`:''}
-          <span class="list-badge">\${badge}</span>
-        </div>\`;
-      }).join('')
-    : '<div class="no-results">No apps match</div>';
-}
-
-function layersSelect(appId) {
-  LY_SEL = appId;
-  document.querySelectorAll('#layersList .list-item').forEach(el=>el.classList.toggle('active', el.querySelector('.list-name')?.title===appId));
-  if (LAYER_LIST_CACHE[appId]) {
-    renderLayerList(appId);
-  } else {
-    document.getElementById('layersDetail').innerHTML = '<div class="empty-state"><span>Loading layers…</span></div>';
-    vscode.postMessage({ command: 'fetchLayerList', appId, ...LAST_RUN });
-  }
-}
-
-// ── safeId: turn any string into a valid HTML id fragment ────────────────
-function safeId(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
-
-// ── Layer list render ────────────────────────────────────────────────────
-function renderLayerList(appId) {
-  const cache = LAYER_LIST_CACHE[appId];
-  if (!cache) return;
-  const { layersA, layersB } = cache;
-  const ea = LAST_RUN.profileA, eb = LAST_RUN.profileB;
-  const app = LY_DATA?.apps.find(a=>a.id===appId);
-  // layerEntries gives every row a unique key, so Map construction can no
-  // longer drop layers that share a name (device/company/WIP variants).
-  const mapA = new Map(layerEntries(layersA).map(e=>[e.key,e.layer]));
-  const mapB = new Map(layerEntries(layersB).map(e=>[e.key,e.layer]));
-  const allKeys = [...new Set([...mapA.keys(),...mapB.keys()])].sort();
-  const rows = allKeys.map(key => ({ key, lA: mapA.get(key)||null, lB: mapB.get(key)||null }));
-
-  const onlyA  = rows.filter(r=>r.lA&&!r.lB);
-  const onlyB  = rows.filter(r=>!r.lA&&r.lB);
-  const inBoth = rows.filter(r=>r.lA&&r.lB);
-
-  let html = \`<div class="detail-hdr">
-    <div style="font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--vscode-descriptionForeground);margin-bottom:4px">App\${app?.subType?' · '+esc(app.subType):''}</div>
-    <div class="detail-title" title="\${esc(appId)}">\${esc(appId)}</div>
-    <div class="detail-meta">
-      <span style="color:var(--c-only-a)">● \${esc(ea)}: \${mapA.size} layer\${mapA.size!==1?'s':''}\${(layersA||[]).length>mapA.size?' ('+((layersA||[]).length-mapA.size)+' blank hidden)':''}</span>
-      <span style="color:var(--c-only-b)">● \${esc(eb)}: \${mapB.size} layer\${mapB.size!==1?'s':''}\${(layersB||[]).length>mapB.size?' ('+((layersB||[]).length-mapB.size)+' blank hidden)':''}</span>
-    </div>
-  </div><div class="fn-section">\`;
-
-  // Surface per-environment fetch failures — a failed GetLayers is not the
-  // same thing as "this environment has 0 layers".
-  if (cache.errorA) html += '<div class="err-banner">⚠ ' + esc(ea) + ' GetLayers failed: ' + esc(cache.errorA) + '</div>';
-  if (cache.errorB) html += '<div class="err-banner">⚠ ' + esc(eb) + ' GetLayers failed: ' + esc(cache.errorB) + '</div>';
-
-  if (!rows.length) {
-    html += '<div class="no-results">No layers found on either environment</div>';
-  } else {
-    if (onlyA.length) {
-      html += \`<div class="section-lbl" style="color:var(--c-only-a)">Only in \${esc(ea)} (\${onlyA.length})</div>\`;
-      for (const r of onlyA) html += renderLayerRow(r, appId, ea, eb);
-    }
-    if (onlyB.length) {
-      html += \`<div class="section-lbl" style="color:var(--c-only-b)">Only in \${esc(eb)} (\${onlyB.length})</div>\`;
-      for (const r of onlyB) html += renderLayerRow(r, appId, ea, eb);
-    }
-    if (inBoth.length) {
-      html += \`<div class="section-lbl">In Both (\${inBoth.length})</div>\`;
-      for (const r of inBoth) html += renderLayerRow(r, appId, ea, eb);
-    }
-  }
-
-  html += '</div>';
-  document.getElementById('layersDetail').innerHTML = html;
-}
-
-function renderLayerRow(row, appId, ea, eb) {
-  const { key, lA, lB } = row;
-  const rid  = 'lr_'  + safeId(appId + '_' + key);
-  const rbid = 'lrb_' + safeId(appId + '_' + key);
-  const inA = !!lA, inB = !!lB;
-  const status = !inA ? 'only-b' : !inB ? 'only-a' : 'in-both';
-  const sc = { 'only-a':'var(--c-only-a)', 'only-b':'var(--c-only-b)', 'in-both':'var(--vscode-descriptionForeground)' };
-  const sb = { 'only-a':esc(ea), 'only-b':esc(eb), 'in-both':'BOTH' };
-  const meta = lA || lB;
-  const typeLabel = meta?.TypeCode ? \`<span style="opacity:.5;font-size:10px"> [\${esc(meta.TypeCode)}]</span>\` : '';
-  const compLabel = meta?.Company  ? \`<span class="list-delta">\${esc(meta.Company)}</span>\` : '';
-  const wipLabel  = (lA?.IsPublished === false || lB?.IsPublished === false)
-    ? '<span style="opacity:.8;font-size:10px;color:var(--c-diff)"> [WIP]</span>' : '';
-
-  const diffBtn   = (inA && inB)
-    ? \`<button class="open-diff-btn" title="Open in VS Code diff editor" onclick="event.stopPropagation();openLayerDiff('\${jsAttr(appId)}','\${jsAttr(key)}')">↗ Diff</button>\`
-    : '';
-  return \`<div class="fn-row" id="\${rid}">
-    <div class="fn-row-hdr" onclick="toggleFn('\${rid}');loadLayerContent('\${jsAttr(appId)}','\${jsAttr(key)}')">
-      <span class="fn-badge" style="background:\${sc[status]}22;color:\${sc[status]}">\${sb[status]}</span>
-      <span class="fn-name">\${esc(key)}\${typeLabel}\${wipLabel}</span>
-      \${compLabel}
-      \${diffBtn}
-      <span class="chevron">▶</span>
-    </div>
-    <div class="fn-body" id="\${rbid}">\${renderLayerRowBody(\`\${appId}::\${key}\`, inA, inB, ea, eb)}</div>
-  </div>\`;
-}
-
-function renderLayerRowBody(contentKey, inA, inB, ea, eb) {
-  const c = LAYER_CONTENT_CACHE[contentKey];
-  if (!c)           return \`<div class="only-info">Click row to load diff…</div>\`;
-  if (c.loading)    return \`<div class="only-info">Loading…</div>\`;
-  if (c.error)      return \`<div class="only-info" style="color:var(--c-only-a)">Error: \${esc(c.error)}</div>\`;
-  if (c.same)       return \`<div class="only-info" style="color:var(--c-match)">✓ Identical</div>\`;
-  if (!inA)         return \`<div style="font-family:var(--vscode-editor-font-family);font-size:calc(var(--vscode-editor-font-size,13px)-1px);padding:10px 14px;max-height:360px;overflow-y:auto;white-space:pre-wrap;word-break:break-all">\${esc(c.normB||'')}</div>\`;
-  if (!inB)         return \`<div style="font-family:var(--vscode-editor-font-family);font-size:calc(var(--vscode-editor-font-size,13px)-1px);padding:10px 14px;max-height:360px;overflow-y:auto;white-space:pre-wrap;word-break:break-all">\${esc(c.normA||'')}</div>\`;
-  return sideBySide(c.normA||'', c.normB||'', ea, eb);
-}
-
-function loadLayerContent(appId, layerKey) {
-  const ck = \`\${appId}::\${layerKey}\`;
-  const cached = LAYER_CONTENT_CACHE[ck];
-  // Loaded or in-flight → nothing to do. A previous *error* must not latch,
-  // though: it used to make the row permanently unclickable (and left
-  // openLayerDiff's PENDING_DIFF waiting on a fetch that never re-fired).
-  if (cached && !cached.error) return;
-  LAYER_CONTENT_CACHE[ck] = { loading: true };
-  const layerA = LAYER_OBJECTS[\`\${appId}::\${layerKey}::a\`] || null;
-  const layerB = LAYER_OBJECTS[\`\${appId}::\${layerKey}::b\`] || null;
-  vscode.postMessage({ command: 'fetchLayerContent', appId, layerKey, layerA, layerB, ...LAST_RUN });
-}
-
-function openLayerDiff(appId, layerKey) {
-  const c = LAYER_CONTENT_CACHE[\`\${appId}::\${layerKey}\`];
-  if (c && !c.loading && !c.error) {
-    sendDiff(c.normA||'', c.normB||'', layerKey.replace(/[^a-zA-Z0-9._-]/g,'_')+'.json', LAST_RUN?.profileA, LAST_RUN?.profileB, appId);
-    return;
-  }
-  PENDING_DIFF = { appId, layerKey };
-  setStatus('Loading layer content for diff…');
-  loadLayerContent(appId, layerKey);
-}
-
 // ── Unified native diff helpers ──────────────────────────────────────────
 // diffId scopes the temp files (library / app / BPM method) so two items that
 // share a filename under different parents don't collide on disk.
@@ -1823,26 +1672,6 @@ function openFnDiff(libId, fnId) {
   if (!fn) return;
   sendDiff(fn.fa?._code||'', fn.fb?._code||'', fnId+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB, libId);
 }
-function openBpmDirDiff(methodCode, dirName) {
-  for (const svc of (BPM_DATA?.services||[])) {
-    for (const m of (svc.methods||[])) {
-      if (m.methodCode !== methodCode) continue;
-      const d = (m.dirDiffs||[]).find(x=>x.name===dirName);
-      if (!d) continue;
-      const safe = dirName.replace(/[^a-zA-Z0-9._-]/g,'_');
-      const hasCode = !!((d.da?._code) || (d.db?._code));
-      // Widget-only directives have no C# code — diff the XAML instead of
-      // opening two empty documents.
-      if (!hasCode && d.fields?.Xaml && !d.fields.Xaml.same) {
-        sendDiff(d.fields.Xaml.a||'', d.fields.Xaml.b||'', safe+'.widgets.txt', LAST_RUN?.profileA, LAST_RUN?.profileB, methodCode);
-      } else {
-        sendDiff(d.da?._code||'', d.db?._code||'', safe+'.cs', LAST_RUN?.profileA, LAST_RUN?.profileB, methodCode);
-      }
-      return;
-    }
-  }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // SHARED DIFF RENDERING
 // ═══════════════════════════════════════════════════════════════════════
@@ -1863,7 +1692,7 @@ function sideBySide(textA, textB, labelA, labelB) {
       cells += \`<div class="diff-cell empty"></div><div class="diff-cell add"><span class="ln">\${nB++}</span>\${esc(d.v)}</div>\`;
     }
   }
-  return \`<div class="diff-wrap"><div class="diff-col-hdrs"><div class="diff-col-hdr a">● \${labelA}</div><div class="diff-col-hdr b">● \${labelB}</div></div><div class="diff-scroll"><div class="diff-grid">\${cells}</div></div></div>\`;
+  return \`<div class="diff-wrap"><div class="diff-col-hdrs"><div class="diff-col-hdr a">\${labelA}</div><div class="diff-col-hdr b">\${labelB}</div></div><div class="diff-scroll"><div class="diff-grid">\${cells}</div></div></div>\`;
 }
 
 function lcs(A, B) {
@@ -1882,7 +1711,7 @@ function lcs(A, B) {
     aligned = [];
   } else if (n > 2500 || m > 2500) {
     // Genuinely massive changed region — alignment too expensive; the
-    // native ↗ Diff button handles these properly.
+    // native Diff button handles these properly.
     aligned = [...midA.map(v=>({t:'-',v})), ...midB.map(v=>({t:'+',v}))];
   } else {
     const dp = Array.from({length:n+1},()=>new Int32Array(m+1));
@@ -1932,7 +1761,7 @@ function inlineListDiff(strA, strB, labelA, labelB) {
     else if(inA){ cells+=\`<div class="diff-cell del">\${esc(item)}</div><div class="diff-cell empty"></div>\`; }
     else       { cells+=\`<div class="diff-cell empty"></div><div class="diff-cell add">\${esc(item)}</div>\`; }
   }
-  return \`<div class="diff-wrap"><div class="diff-col-hdrs"><div class="diff-col-hdr a">● \${labelA}</div><div class="diff-col-hdr b">● \${labelB}</div></div><div class="diff-scroll"><div class="diff-grid">\${cells}</div></div></div>\`;
+  return \`<div class="diff-wrap"><div class="diff-col-hdrs"><div class="diff-col-hdr a">\${labelA}</div><div class="diff-col-hdr b">\${labelB}</div></div><div class="diff-scroll"><div class="diff-grid">\${cells}</div></div></div>\`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1967,6 +1796,9 @@ function switchLibTab(btn, lid, tab) {
   document.querySelectorAll(\`[data-libtab="\${lid}"]\`).forEach(p=>p.classList.remove('active'));
   document.querySelector(\`[data-libtab="\${lid}"][data-tab="\${tab}"]\`)?.classList.add('active');
 }
+</script>
+<script>
+${COMPARE_WEBVIEW_JS}
 </script>
 </body>
 </html>`;

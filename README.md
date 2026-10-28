@@ -13,6 +13,9 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 - **Browse** all EFx libraries and their functions in the EFx Explorer sidebar
 - **Pull** function C# code into a local `.cs` file with one click
 - **Push** edited code back to Epicor with live compile diagnostics shown as VS Code squiggles
+- **Widget-based functions** open the same widget graph BPM directives use
+  - A function whose flow is nothing but one Custom Code widget opens straight as C# — no graph in the way
+  - Anything richer opens as a graph; **double-click a Custom Code widget** to edit that widget's C# in a real editor, and saving pushes it back into that exact widget
 - **Auto-push on save** — enable per-profile to automatically push every time you save a `.cs` file
 - **Execute** functions directly from VS Code with a built-in request/response panel
   - Automatically routes unpromoted (staging) libraries through `/api/v2/efx/staging/...`
@@ -33,6 +36,7 @@ A VS Code extension for working with Epicor Kinetic EFx Function Libraries and B
 - **Browse** all BPM services, methods, and directives in the BPM Methods sidebar
 - **Pull** C# custom code from any directive into a local `.cs` file
 - **Push** edited directive code back to Epicor with live compile diagnostics
+- **Widget graph** for any directive, with double-click editing of each Custom Code widget
 
 ### Environment Comparison
 
@@ -158,6 +162,7 @@ Expand any library's **Tables** group to see its table references. Hover a table
 | `EFx: Refresh Libraries` | Reload the library list from the server |
 | `EFx: Pull Function Code` | Pull a function's C# code to a local file |
 | `EFx: Push Function Code` | Push edited code back to Epicor |
+| `EFx: Open Widget Graph` | Open a widget-based function's flow graph |
 | `EFx: Execute Function` | Open the execute panel for a function |
 | `EFx: New Library` | Create a new EFx library |
 | `EFx: New Function` | Create a new function in a library |
@@ -204,6 +209,12 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 
 ## Changelog
 
+### 0.8.0
+- **Widget-based functions supported** — the widget XAML parser that powered BPM directives now backs Epicor Functions too, so Kind 0 / Kind 1 functions are no longer hidden from the tree
+- A function that is only a Custom Code widget opens straight as C#; multi-widget functions open as a graph
+- **Double-click a Custom Code widget** (function or BPM) to edit its C# in a real editor — saving pushes it back into that widget
+- Find in Functions indexes widget custom code, and Compare Libraries renders widget functions as a readable flow instead of raw XAML
+
 ### 0.6.0
 - **Set Read-only / Updatable** — right-click any table reference in the tree to toggle its access mode without removing and re-adding it
 - **Source restructure** — all source moved into `src/` with esbuild bundling; cleaner build and easier to contribute to
@@ -249,5 +260,6 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 
 ## Known Limitations
 
-- The extension does not support widget-based functions (Kind 0) — only code-based (Kind 2) and widget+code (Kind 1)
-- BPM directives without custom C# code (widget-only) are shown but cannot be pulled/pushed
+- Widget graphs are read/edit only — widgets can be re-configured and their C# rewritten, but widgets cannot be added, removed, or re-wired from here
+- **Compare Libraries** can diff a widget-based function but cannot apply one across environments (apply writes through the Code/Usings path, which cannot carry a widget flow)
+- BPM directives without custom C# code (widget-only) are shown but cannot be pulled as a `.cs` file — edit them from the widget graph
