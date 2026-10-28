@@ -277,6 +277,33 @@ class BpmClient {
             return {};
         }
     }
+    // ── All methods + directives for one source in a single call ──
+    // Used for data directives (source 'DB'), which aren't listed by
+    // GetBpmDirectiveServicesTS the way method directives are.
+    async getBpmRowsBySource(source) {
+        const result = await this.request(this.getBpmUrl('GetRowsEx'), {
+            source,
+            whereClauseBpMethod: '',
+            whereClauseBpDirective: '',
+            pageSize: 0,
+            absolutePage: 0,
+        });
+        const ts = result.returnObj;
+        return { methods: ts?.BpMethod || [], directives: ts?.BpDirective || [] };
+    }
+
+    // ── One directive as the Kinetic designer's JSON model ──
+    // The server converts the stored Body (classic XAML or Version-3 JSON) into
+    // the same JSON shape, so two environments stored in different formats
+    // become comparable. Returns the parsed object (or null).
+    async getKineticDirective(directiveId) {
+        const res = await this._client.requestGet(
+            this.getBpmUrl('GetKineticDirective') + '?directiveId=' + encodeURIComponent(directiveId));
+        const v = res?.returnObj ?? res;
+        if (typeof v === 'string') { try { return JSON.parse(v); } catch { return null; } }
+        return v && typeof v === 'object' ? v : null;
+    }
+
     // ── Validate custom code (syntax check without saving) ──
     async validateCustomCode(code, functionDefinition) {
         const codeSnippetWithScope = JSON.stringify({ Code: code, IsCondition: false });

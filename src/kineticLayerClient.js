@@ -218,12 +218,12 @@ class KineticMetaFXClient {
     // Fetch the merged app content for a specific layer via GetApp (GET).
     // layerDescription is the LayerDescription string from GetLayers (e.g. "V5_2594_20260529_MB").
     // Returns returnObj: { Layout, Events, DataViews, Rules, ToolBar, Pages, Properties, ... }
-    async getAppForLayer(viewId, layerDescription) {
+    async getAppForLayer(viewId, layerDescription, deviceType = "Desktop") {
         console.log(`[MetaFX] getAppForLayer → viewId="${viewId}" layer="${layerDescription}"`);
         const request = {
             id: viewId,
             properties: {
-                deviceType: "Desktop",
+                deviceType: deviceType || "Desktop",
                 layers: [layerDescription],
                 baseAppVersion: 0,
                 layerVersion: 0,

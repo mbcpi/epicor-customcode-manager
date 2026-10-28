@@ -1,0 +1,855 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// Compare panel — BPM + Layers tabs (webview side).
+// Plain browser JS, injected after the panel's main <script>, so it shares that
+// script's globals (BPM_DATA, LY_DATA, LAST_RUN, esc, jsAttr, chip, sideBySide,
+// sendDiff, toggleFn, switchFnTab, setStatus, …).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const STATUS_COLOR = { match: 'var(--c-match)', diff: 'var(--c-diff)', changed: 'var(--c-diff)', renamed: 'var(--c-diff)',
+  'only-a': 'var(--c-only-a)', 'only-b': 'var(--c-only-b)', 'in-both': 'var(--vscode-descriptionForeground)',
+  'layers-differ': 'var(--c-diff)' };
+const pre = (t, dim) => `<div class="pre-block${dim ? ' dim' : ''}">${esc(t || '')}</div>`;
+const tag = (t, cls) => `<span class="tag${cls ? ' ' + cls : ''}">${esc(t)}</span>`;
+// Turn any string into a valid HTML id fragment (also used by the main script's handlers).
+function safeId(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
+// ═══════════════════════════════════════════════════════════════════════
+// BPM TAB
+// ═══════════════════════════════════════════════════════════════════════
+
+let BPM_INDEX = new Map(); // directive key -> dir entry
+
+function bpmFilter(f, el) {
+  BPM_FILTER = f;
+  document.querySelectorAll('[data-chip="bpmFilter"]').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  bpmApply();
+}
+
+function renderBpmSummary() {
+  const c = BPM_DATA.counts, ea = esc(LAST_RUN.profileA), eb = esc(LAST_RUN.profileB);
+  BPM_INDEX = new Map();
+  for (const s of BPM_DATA.services) for (const m of s.methods) for (const d of m.dirs) BPM_INDEX.set(d.key, d);
+  document.getElementById('bpmSummary').innerHTML =
+    chip('all',     'chip-all',    'All',            'bpmFilter', BPM_DATA.total) +
+    chip('diff',    'chip-diff',   'Different',      'bpmFilter', c.diff) +
+    chip('only-a',  'chip-only-a', 'Deleted (not in ' + eb + ')',  'bpmFilter', c['only-a']) +
+    chip('only-b',  'chip-only-b', 'Added (not in ' + ea + ')',    'bpmFilter', c['only-b']) +
+    chip('renamed', 'chip-diff',   'Renamed',        'bpmFilter', c.renamed) +
+    chip('match',   'chip-match',  'Match',          'bpmFilter', c.match);
+  let w = document.getElementById('bpmWarn');
+  if (!w) {
+    w = document.createElement('div'); w.id = 'bpmWarn';
+    const sum = document.getElementById('bpmSummary'); sum.parentNode.insertBefore(w, sum);
+  }
+  w.innerHTML = (BPM_DATA.warnings || []).map(t => `<div class="err-banner">${esc(t)}</div>`).join('');
+  document.getElementById('bpmBadge').textContent = BPM_DATA.total;
+}
+
+function bpmDirVisible(d, q) {
+  const e = d.a || d.b;
+  if (BPM_FILTER !== 'all' && d.status !== BPM_FILTER) return false;
+  if (document.getElementById('bpmHideDisabled')?.checked && !((d.a && d.a.IsEnabled) || (d.b && d.b.IsEnabled))) return false;
+  if (document.getElementById('bpmCodeOnly')?.checked && !(d.fields ? !d.fields.Code.same : !!e.code)) return false;
+  if (q && !(String(e.Name).toLowerCase().includes(q) || String(e.BpMethodCode).toLowerCase().includes(q)
+      || (d.renamedTo || '').toLowerCase().includes(q))) return false;
+  return true;
+}
+
+function bpmVisibleServices() {
+  const q = (document.getElementById('bpmSearch').value || '').toLowerCase().trim();
+  const src = document.getElementById('bpmSource')?.value || '';
+  const out = [];
+  for (const s of BPM_DATA.services) {
+    if (src && s.source !== src) continue;
+    const svcHit = q && s.businessObject.toLowerCase().includes(q);
+    const methods = s.methods.map(m => ({ m, dirs: m.dirs.filter(d => bpmDirVisible(d, svcHit ? '' : q)) }))
+      .filter(x => x.dirs.length);
+    if (methods.length) out.push({ s, methods });
+  }
+  return out;
+}
+
+function bpmApply() {
+  if (!BPM_DATA) return;
+  const vis = bpmVisibleServices();
+  document.getElementById('bpmList').innerHTML = vis.length
+    ? vis.map(({ s, methods }) => {
+        const delta = methods.reduce((n, x) => n + x.dirs.filter(d => d.status !== 'match').length, 0);
+        const cls = delta ? 's-diff' : 's-match';
+        return `<div class="list-item ${cls} ${s.svcKey === BPM_SEL ? 'active' : ''}" data-key="${esc(s.svcKey)}" onclick="bpmSelect('${jsAttr(s.svcKey)}')">
+          <div class="list-dot"></div>
+          <span class="list-name" title="${esc(s.systemCode + '.' + s.businessObject)}">${esc(s.businessObject)}</span>
+          ${s.source === 'DB' ? '<span class="list-delta">DATA</span>' : ''}
+          ${delta ? `<span class="list-delta">${delta} diff</span>` : ''}
+          <span class="list-badge">${delta ? 'DIFF' : 'MATCH'}</span>
+        </div>`;
+      }).join('')
+    : '<div class="no-results">No directives match</div>';
+  if (BPM_SEL) {
+    const hit = vis.find(x => x.s.svcKey === BPM_SEL);
+    if (hit) renderBpmDetail(hit.s, hit.methods);
+    else document.getElementById('bpmDetail').innerHTML = '<div class="empty-state"><span>Select a service</span></div>';
+  }
+}
+
+function bpmSelect(svcKey) {
+  BPM_SEL = svcKey;
+  document.querySelectorAll('#bpmList .list-item').forEach(el => el.classList.toggle('active', el.dataset.key === svcKey));
+  const hit = bpmVisibleServices().find(x => x.s.svcKey === svcKey);
+  if (hit) renderBpmDetail(hit.s, hit.methods);
+}
+
+function renderBpmDetail(svc, methods) {
+  const ea = LAST_RUN.profileA, eb = LAST_RUN.profileB;
+  const n = methods.reduce((k, x) => k + x.dirs.length, 0);
+  let html = `<div class="detail-hdr">
+    <div class="detail-title">${esc(svc.businessObject)}</div>
+    <div class="detail-meta">
+      <span>${esc(svc.systemCode)}</span>
+      <span>${svc.source === 'DB' ? 'Data directives' : 'Method directives'}</span>
+      <span>| ${methods.length} method${methods.length !== 1 ? 's' : ''} · ${n} directive${n !== 1 ? 's' : ''} shown</span>
+    </div>
+  </div><div class="fn-section">`;
+  for (const { m, dirs } of methods) {
+    const side = !m.inA ? ` ${tag('method added in ' + eb)}` : !m.inB ? ` ${tag('method deleted in ' + eb)}` : '';
+    html += `<div class="section-lbl">${esc(m.methodName)}<span style="opacity:.5;font-weight:400;letter-spacing:0;text-transform:none"> · ${esc(m.methodCode)}</span>${side}</div>`;
+    for (const d of dirs) html += renderBpmDirRow(d, ea, eb);
+  }
+  html += '</div>';
+  document.getElementById('bpmDetail').innerHTML = html;
+}
+
+function renderBpmDirRow(d, ea, eb) {
+  const e = d.a || d.b;
+  const id = 'bpm_' + safeId(d.key);
+  const sb = { match: 'MATCH', diff: 'DIFF', renamed: 'RENAMED', 'only-a': 'DELETED', 'only-b': 'ADDED' };
+  const bc = { ...STATUS_COLOR, 'only-a': LY_COLOR['only-a'], 'only-b': LY_COLOR['only-b'] };
+  const changed = d.fields ? Object.entries(d.fields).filter(([k, v]) => k !== 'hasDiff' && v && !v.same && !v.infoOnly).map(([k]) => k) : [];
+  const tags = [];
+  if (d.a && d.b && d.a.IsEnabled !== d.b.IsEnabled) tags.push(tag('enabled ' + (d.a.IsEnabled ? ea : eb) + ' only', 'warn'));
+  else if (!e.IsEnabled) tags.push(tag('disabled'));
+  if (e.DirectiveGroup) tags.push(tag(e.DirectiveGroup));
+  if (d.fields && !d.fields.Format.same) tags.push(tag('xaml vs json, normalized', 'warn'));
+  else if (e.origFormat === 'json') tags.push(tag('json'));
+  if (d.layoutDiff) tags.push(tag('layout changed'));
+  const name = d.status === 'renamed' ? `${esc(d.a.Name)} -> ${esc(d.renamedTo)}` : esc(e.Name);
+  const hasCode = !!((d.a && d.a.code) || (d.b && d.b.code));
+  return `<div class="fn-row" id="${id}">
+    <div class="fn-row-hdr" onclick="bpmToggle('${jsAttr(d.key)}')">
+      <span class="fn-badge" style="background:${bc[d.status]}22;color:${bc[d.status]}">${esc(sb[d.status])}</span>
+      <span class="fn-name">${name} <span style="opacity:.5;font-size:10px">[${esc(d.typeLabel)}]</span>${tags.join('')}</span>
+      ${changed.length ? `<span class="fn-changed">${esc(changed.join(', '))}</span>` : ''}
+      <button class="open-diff-btn" title="Widgets + code, canonical" onclick="event.stopPropagation();openBpmDirDiff('${jsAttr(d.key)}','text')">Diff</button>
+      ${hasCode ? `<button class="open-diff-btn" title="Custom code blocks only" onclick="event.stopPropagation();openBpmDirDiff('${jsAttr(d.key)}','code')">Code</button>` : ''}
+      <button class="open-diff-btn" title="Stored body as saved (XAML or Kinetic JSON)" onclick="event.stopPropagation();openBpmRawDiff('${jsAttr(d.key)}')">${e.origFormat === 'json' ? 'JSON' : 'XML'}</button>
+      <span class="chevron"></span>
+    </div>
+    <div class="fn-body" data-filled="0"></div>
+  </div>`;
+}
+
+function bpmToggle(key) {
+  const row = document.getElementById('bpm_' + safeId(key));
+  if (!row) return;
+  row.classList.toggle('open');
+  const body = row.querySelector('.fn-body');
+  if (body.dataset.filled === '1') return;
+  body.dataset.filled = '1';
+  body.innerHTML = renderBpmDirBody(BPM_INDEX.get(key), LAST_RUN.profileA, LAST_RUN.profileB);
+}
+
+function renderBpmDirBody(d, ea, eb) {
+  if (!d) return '';
+  const fid = safeId(d.key);
+  const tabs = [], panes = [];
+  const add = (name, label, html) => {
+    const first = !tabs.length;
+    tabs.push(`<button class="tab${first ? ' active' : ''}" onclick="switchFnTab(this,'${fid}','${name}')">${label}</button>`);
+    panes.push(`<div class="pane${first ? ' active' : ''}" data-fn="${fid}" data-tab="${name}">${html}</div>`);
+  };
+  if (d.status === 'only-a' || d.status === 'only-b') {
+    const e = d.a || d.b, env = d.status === 'only-a' ? ea : eb;
+    add('f', 'Flow', bpmFlowHtml(d, ea, eb));
+    add('w', 'Widgets', `<div class="only-info">${d.status === 'only-a' ? 'DELETED: in ' + esc(ea) + ' (control), missing from ' + esc(eb) : 'ADDED: in ' + esc(eb) + ', not in ' + esc(ea) + ' (control)'}</div>` + pre(e.text));
+    if (e.code) add('c', 'Code', pre(e.code));
+    if (e.layout) add('l', 'Layout', pre(e.layout, true));
+    return `<div class="tabs">${tabs.join('')}</div>${panes.join('')}`;
+  }
+  const f = d.fields || {};
+  const mark = k => (f[k] && !f[k].same ? ' *' : '');
+  add('f', 'Flow' + mark('Widgets'), bpmFlowHtml(d, ea, eb));
+  add('w', 'Widgets' + mark('Widgets'), f.Widgets && f.Widgets.same ? pre(d.a.text, true) : sideBySide(d.a.text || '', d.b.text || '', ea, eb));
+  if (d.a.code || d.b.code) add('c', 'Code' + mark('Code'), f.Code && f.Code.same ? pre(d.a.code, true) : sideBySide(d.a.code || '', d.b.code || '', ea, eb));
+  add('l', 'Layout' + (d.layoutDiff ? ' *' : ''), d.layoutDiff ? sideBySide(d.a.layout || '', d.b.layout || '', ea, eb) : pre(d.a.layout, true));
+  const rows = ['DirectiveType', 'IsEnabled', 'Order', 'DirectiveGroup', 'MethodDisabled', 'Format'].map(k => {
+    const x = f[k]; if (!x) return '';
+    return `<tr ${!x.same ? 'class="changed"' : ''}><td>${k}</td><td class="${x.same ? 'vs' : 'va'}">${esc(x.a || '—')}</td><td class="${x.same ? 'vs' : 'vb'}">${esc(x.b || '—')}</td></tr>`;
+  }).join('') + `<tr><td>DirectiveID</td><td>${esc(d.a.DirectiveID)}</td><td>${esc(d.b.DirectiveID)}</td></tr>`;
+  const note = d.a.normalized || d.b.normalized ? '<div class="only-info">Stored formats differ — both sides loaded through GetKineticDirective so they compare like-for-like.</div>' : '';
+  const meta = ['DirectiveType', 'IsEnabled', 'Order', 'DirectiveGroup', 'MethodDisabled'].some(k => f[k] && !f[k].same);
+  add('m', 'Settings' + (meta ? ' *' : ''), note + `<table class="meta-tbl"><thead><tr><th>Field</th><th>A (control) ${esc(ea)}</th><th>B ${esc(eb)}</th></tr></thead><tbody>${rows}</tbody></table>`);
+  return `<div class="tabs">${tabs.join('')}</div>${panes.join('')}`;
+}
+
+function openBpmRawDiff(key) {
+  const d = BPM_INDEX.get(key); if (!d) return;
+  vscode.postMessage({ command: 'openBpmRaw', keyA: d.a && d.a.key, keyB: d.b && d.b.key,
+    name: (d.a || d.b).Name, labelA: LAST_RUN.profileA, labelB: LAST_RUN.profileB });
+}
+
+function openBpmDirDiff(key, which) {
+  const d = BPM_INDEX.get(key); if (!d) return;
+  const e = d.a || d.b;
+  const safe = String(e.Name).replace(/[^a-zA-Z0-9._-]/g, '_');
+  sendDiff((d.a && d.a[which]) || '', (d.b && d.b[which]) || '', safe + (which === 'code' ? '.cs' : '.bpm.txt'),
+    LAST_RUN.profileA, LAST_RUN.profileB, e.Source + '_' + e.BpMethodCode + '_' + e.DirectiveType);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// LAYERS TAB
+// ═══════════════════════════════════════════════════════════════════════
+
+let LAYER_SECTIONS = {}; // appId::layerKey -> { sections, wireA, wireB }
+
+window.addEventListener('message', ({ data: msg }) => {
+  if (msg.command === 'layerSectionsReady') {
+    LAYER_SECTIONS[msg.appId + '::' + msg.layerKey] = { sections: msg.sections, wireA: msg.wireA, wireB: msg.wireB };
+  } else if (msg.command === 'compareStarted') {
+    LAYER_SECTIONS = {};
+  }
+});
+
+function lyFilter(f, el) {
+  LY_FILTER = f;
+  document.querySelectorAll('[data-chip="lyFilter"]').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  layersApply();
+}
+
+function renderLayersSummary() {
+  const c = LY_DATA.counts;
+  document.getElementById('layersSummary').innerHTML =
+    chip('all',           'chip-all',    'All',                                    'lyFilter', LY_DATA.total) +
+    chip('layers-differ', 'chip-diff',   'Layers differ',                          'lyFilter', c['layers-differ']) +
+    chip('only-a',        'chip-only-a', 'Deleted app (not in ' + esc(LAST_RUN.profileB) + ')', 'lyFilter', c['only-a']) +
+    chip('only-b',        'chip-only-b', 'Added app (not in ' + esc(LAST_RUN.profileA) + ')',   'lyFilter', c['only-b']) +
+    chip('in-both',       'chip-match',  'Same layer set',                         'lyFilter', c['in-both']);
+}
+
+function layersApply() {
+  if (!LY_DATA) return;
+  const q = (document.getElementById('layersSearch').value || '').toLowerCase().trim();
+  const items = LY_DATA.apps.filter(a => (LY_FILTER === 'all' || a.status === LY_FILTER)
+    && (!q || a.id.toLowerCase().includes(q) || a.layers.some(l => l.key.toLowerCase().includes(q))));
+  const cls = { 'only-a': 's-only-a', 'only-b': 's-only-b', 'layers-differ': 's-diff', 'in-both': 's-in-both' };
+  const badge = a => a.status === 'only-a' ? 'DELETED' : a.status === 'only-b' ? 'ADDED' : a.status === 'layers-differ' ? 'DIFF' : 'BOTH';
+  document.getElementById('layersList').innerHTML = items.length
+    ? items.map(a => `<div class="list-item ${cls[a.status]} ${a.id === LY_SEL ? 'active' : ''}" data-key="${esc(a.id)}" onclick="layersSelect('${jsAttr(a.id)}')">
+        <div class="list-dot"></div>
+        <span class="list-name" title="${esc(a.id)}">${esc(a.id)}</span>
+        <span class="list-delta">${a.layerDelta ? a.layerDelta + ' diff' : a.layerCount + ' layers'}</span>
+        <span class="list-badge">${esc(badge(a))}</span>
+      </div>`).join('')
+    : '<div class="no-results">No apps match</div>';
+}
+
+function layersSelect(appId) {
+  LY_SEL = appId;
+  document.querySelectorAll('#layersList .list-item').forEach(el => el.classList.toggle('active', el.dataset.key === appId));
+  renderLayerList(appId);
+}
+
+function renderLayerList(appId) {
+  const app = LY_DATA && LY_DATA.apps.find(a => a.id === appId);
+  if (!app) return;
+  const ea = LAST_RUN.profileA, eb = LAST_RUN.profileB;
+  for (const r of app.layers) {
+    if (r.lA) LAYER_OBJECTS[appId + '::' + r.key + '::a'] = r.lA; else delete LAYER_OBJECTS[appId + '::' + r.key + '::a'];
+    if (r.lB) LAYER_OBJECTS[appId + '::' + r.key + '::b'] = r.lB; else delete LAYER_OBJECTS[appId + '::' + r.key + '::b'];
+  }
+  const nA = app.layers.filter(r => r.lA).length, nB = app.layers.filter(r => r.lB).length;
+  let html = `<div class="detail-hdr">
+    <div style="font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--vscode-descriptionForeground);margin-bottom:4px">${esc(app.subType || 'App')}${app.systemApp ? ' · Epicor app' : ' · custom app'}</div>
+    <div class="detail-title" title="${esc(appId)}">${esc(appId)}</div>
+    <div class="detail-meta">
+      <span>A (control) ${esc(ea)}: ${nA} custom layer${nA !== 1 ? 's' : ''}</span>
+      <span>B ${esc(eb)}: ${nB} custom layer${nB !== 1 ? 's' : ''}</span>
+    </div>
+  </div><div class="fn-section">`;
+  const groups = [['only-a', 'Deleted (in ' + ea + ', missing from ' + eb + ')', ''], ['only-b', 'Added (in ' + eb + ', not in ' + ea + ')', ''], ['in-both', 'In both', '']];
+  for (const [st, label, color] of groups) {
+    const rows = app.layers.filter(r => r.status === st);
+    if (!rows.length) continue;
+    html += `<div class="section-lbl"${color ? ` style="color:${color}"` : ''}>${esc(label)} (${rows.length})</div>`;
+    for (const r of rows) html += renderLayerRow(r, appId, ea, eb);
+  }
+  html += '</div>';
+  document.getElementById('layersDetail').innerHTML = html;
+}
+
+function layerStamp(l) { return l ? `${(l.LastUpdated || '').slice(0, 10)}${l.LastUpdatedBy ? ' · ' + l.LastUpdatedBy : ''}` : '—'; }
+
+function renderLayerRow(row, appId, ea, eb) {
+  const { key, lA, lB, status } = row;
+  const rid = 'lr_' + safeId(appId + '_' + key), rbid = 'lrb_' + safeId(appId + '_' + key);
+  const sb = LY_WORD;
+  const meta = lA || lB;
+  const tags = [];
+  if (meta.DeviceType && meta.DeviceType !== 'Desktop') tags.push(tag(meta.DeviceType));
+  const scope = l => (l.Company ? l.Company : 'all companies');
+  if (row.companyDiffers) tags.push(tag('company: ' + ea + ' ' + scope(lA) + ' / ' + eb + ' ' + scope(lB), 'warn'));
+  else if (meta.Company) tags.push(tag(meta.Company));
+  if (row.publishDiffers) tags.push(tag('unpublished in ' + (lA.IsPublished === false ? ea : eb), 'warn'));
+  else if ((lA && lA.IsPublished === false) || (lB && lB.IsPublished === false)) tags.push(tag('unpublished'));
+  const stamp = lA && lB
+    ? `<span class="fn-changed" ${row.updatedDiffers ? 'style="color:var(--c-diff)"' : ''} title="Last updated">${esc(ea)} ${esc(layerStamp(lA))} | ${esc(eb)} ${esc(layerStamp(lB))}</span>`
+    : `<span class="fn-changed">${esc(layerStamp(meta))}</span>`;
+  const diffBtn = (lA && lB)
+    ? `<button class="open-diff-btn" title="Open full merged JSON in VS Code diff" onclick="event.stopPropagation();openLayerDiff('${jsAttr(appId)}','${jsAttr(key)}')">Diff</button>` : '';
+  return `<div class="fn-row" id="${rid}">
+    <div class="fn-row-hdr" onclick="toggleFn('${rid}');loadLayerContent('${jsAttr(appId)}','${jsAttr(key)}')">
+      <span class="fn-badge" style="background:${LY_COLOR[status]}22;color:${LY_COLOR[status]}">${esc(sb[status])}</span>
+      <span class="fn-name">${esc(key)}${tags.join('')}</span>
+      ${stamp}
+      ${diffBtn}
+      <span class="chevron"></span>
+    </div>
+    <div class="fn-body" id="${rbid}">${renderLayerRowBody(appId + '::' + key, !!lA, !!lB, ea, eb)}</div>
+  </div>`;
+}
+
+function loadLayerContent(appId, layerKey) {
+  const ck = appId + '::' + layerKey;
+  const cached = LAYER_CONTENT_CACHE[ck];
+  if (cached && !cached.error) return;
+  LAYER_CONTENT_CACHE[ck] = { loading: true };
+  const layerA = LAYER_OBJECTS[ck + '::a'] || null, layerB = LAYER_OBJECTS[ck + '::b'] || null;
+  vscode.postMessage({ command: 'fetchLayerContent', appId, layerKey, layerA, layerB, ...LAST_RUN });
+}
+
+function openLayerDiff(appId, layerKey) {
+  const c = LAYER_CONTENT_CACHE[appId + '::' + layerKey];
+  if (c && !c.loading && !c.error) {
+    sendDiff(c.normA || '', c.normB || '', layerKey.replace(/[^a-zA-Z0-9._-]/g, '_') + '.json', LAST_RUN.profileA, LAST_RUN.profileB, appId);
+    return;
+  }
+  PENDING_DIFF = { appId, layerKey };
+  setStatus('Loading layer content for diff…');
+  loadLayerContent(appId, layerKey);
+}
+
+function renderLayerRowBody(ck, inA, inB, ea, eb) {
+  const c = LAYER_CONTENT_CACHE[ck];
+  if (!c) return '<div class="only-info">Click row to load…</div>';
+  if (c.loading) return '<div class="only-info">Loading…</div>';
+  if (c.error) return `<div class="only-info" style="color:var(--c-only-a)">Error: ${esc(c.error)}</div>`;
+  const sec = LAYER_SECTIONS[ck];
+  const fid = safeId(ck);
+  const totals = { added: 0, removed: 0, changed: 0 };
+  for (const s of (sec ? sec.sections : [])) { totals.added += s.counts.added; totals.removed += s.counts.removed; totals.changed += s.counts.changed; }
+  const head = c.same
+    ? '<div class="only-info" style="color:var(--c-match)">Identical merged content</div>'
+    : `<div class="only-info">vs ${esc(ea)} (control): ${totals.changed} changed · ${totals.removed} deleted · ${totals.added} added</div>`;
+  return `<div class="tabs">
+      <button class="tab active" onclick="switchFnTab(this,'${fid}','chg')">Changes</button>
+      <button class="tab" onclick="switchFnTab(this,'${fid}','wf');lyWireInit('${jsAttr(ck)}')">Preview</button>
+      <button class="tab" onclick="switchFnTab(this,'${fid}','json');lyJsonInit('${jsAttr(ck)}')">Full JSON</button>
+    </div>
+    <div class="pane active" data-fn="${fid}" data-tab="chg">${head}${sec ? lySectionsHtml(ck, ea, eb) : ''}</div>
+    <div class="pane" data-fn="${fid}" data-tab="wf"><div id="wf_${fid}" class="only-info">Loading preview…</div></div>
+    <div class="pane" data-fn="${fid}" data-tab="json"><div id="js_${fid}" class="only-info">Rendering…</div></div>`;
+}
+
+function lyItemRowHtml(ck, si, ii, it, lbl, ea, eb) {
+  const id = 'lyi_' + safeId(ck) + '_' + si + '_' + ii;
+  const shortKey = String(it.key).split(' / ').slice(1).join(' / ') || it.key;
+  return `<div class="fn-row" id="${id}">
+    <div class="fn-row-hdr" onclick="lyItemToggle('${jsAttr(ck)}',${si},${ii})">
+      <span class="fn-badge" style="background:${LY_COLOR[it.status]}22;color:${LY_COLOR[it.status]}">${esc(lbl[it.status])}</span>
+      <span class="fn-name">${esc(it.label)} <span style="opacity:.5;font-size:10px">${esc(shortKey)}</span></span>
+      ${(it.fields || []).some(f => /(^|\.)epBinding$/i.test(f.path)) ? `<span class="tag warn">binding changed</span>` : ''}
+      ${it.fieldCount ? `<span class="fn-changed">${it.structural ? 'children only' : it.fieldCount + ' field' + (it.fieldCount !== 1 ? 's' : '')}</span>` : ''}
+      <button class="open-diff-btn" onclick="event.stopPropagation();lyItemDiff('${jsAttr(ck)}',${si},${ii})">Diff</button>
+      <span class="chevron"></span>
+    </div>
+    <div class="fn-body" data-filled="0"></div>
+  </div>`;
+}
+
+const LY_PAGE_SECTIONS = new Set(['Layout', 'Pages']);
+
+function lyCountNodes(roots) { let n = 0; const w = a => { for (const x of a || []) { n++; w(x.children); } }; w(roots); return n; }
+
+function lySectionsHtml(ck, ea, eb) {
+  const sec = LAYER_SECTIONS[ck];
+  const inA = !!LAYER_OBJECTS[ck + '::a'], inB = !!LAYER_OBJECTS[ck + '::b'];
+  let html = `<table class="meta-tbl"><thead><tr><th>Section</th><th>changed</th><th>deleted</th><th>added</th><th>same</th></tr></thead><tbody>`;
+  for (const s of sec.sections) {
+    const any = s.counts.changed + s.counts.added + s.counts.removed;
+    html += `<tr ${any ? 'class="changed"' : ''}><td>${esc(s.name)}</td><td>${s.counts.changed}</td><td>${s.counts.removed}</td><td>${s.counts.added}</td><td>${s.counts.same}</td></tr>`;
+  }
+  html += '</tbody></table>';
+
+  // One-sided layer: nothing to pair up — list its pages, not every component.
+  if (!inA || !inB) {
+    const pages = (inA ? sec.wireA : sec.wireB) || [];
+    html += `<div class="only-info">${inA ? 'DELETED: layer is in ' + esc(ea) + ' (control) but missing from ' + esc(eb) : 'ADDED: layer is in ' + esc(eb) + ' but not in ' + esc(ea) + ' (control)'} - see Preview / Full JSON for its content.</div>`;
+    html += `<table class="meta-tbl"><thead><tr><th>Page</th><th>Caption</th><th>Components</th></tr></thead><tbody>${
+      pages.map(p => `<tr><td>${esc(p.key)}</td><td>${esc(p.caption)}</td><td>${lyCountNodes(p.roots)}</td></tr>`).join('')}</tbody></table>`;
+    return html;
+  }
+
+  const lbl = LY_WORD;
+  sec.sections.forEach((s, si) => {
+    if (!s.items.length) return;
+    html += `<div class="section-lbl" style="margin-top:10px">${esc(s.name)} (${s.items.length})</div>`;
+    if (!LY_PAGE_SECTIONS.has(s.name)) {
+      s.items.forEach((it, ii) => { html += lyItemRowHtml(ck, si, ii, it, lbl, ea, eb); });
+      return;
+    }
+    // Group component items under their page; rows render when a page opens.
+    const groups = new Map();
+    s.items.forEach((it, ii) => {
+      const page = String(it.key).split(' / ')[0];
+      if (!groups.has(page)) groups.set(page, []);
+      groups.get(page).push(ii);
+    });
+    let gi = 0;
+    for (const [page, idx] of groups) {
+      const c = { changed: 0, 'only-a': 0, 'only-b': 0 };
+      for (const ii of idx) c[s.items[ii].status]++;
+      const gid = 'lyg_' + safeId(ck) + '_' + si + '_' + (gi++);
+      const parts = [];
+      if (c.changed) parts.push(c.changed + ' changed');
+      if (c['only-a']) parts.push(c['only-a'] + ' deleted');
+      if (c['only-b']) parts.push(c['only-b'] + ' added');
+      html += `<div class="fn-row ly-group" id="${gid}" data-ck="${esc(ck)}" data-si="${si}" data-idx="${idx.join(',')}">
+        <div class="fn-row-hdr" onclick="lyGroupToggle('${gid}')">
+          <span class="fn-name"><b>${esc(page)}</b></span>
+          <span class="fn-changed">${esc(parts.join(' | '))}</span>
+          <span class="chevron"></span>
+        </div>
+        <div class="fn-body" data-filled="0" style="padding:0 0 4px 14px"></div>
+      </div>`;
+    }
+  });
+  return html;
+}
+
+function lyGroupToggle(gid) {
+  const row = document.getElementById(gid);
+  if (!row) return;
+  row.classList.toggle('open');
+  const body = row.querySelector('.fn-body');
+  if (body.dataset.filled === '1') return;
+  body.dataset.filled = '1';
+  const ck = row.dataset.ck, si = +row.dataset.si, sec = LAYER_SECTIONS[ck];
+  const ea = LAST_RUN.profileA, eb = LAST_RUN.profileB, lbl = LY_WORD;
+  body.innerHTML = row.dataset.idx.split(',').map(Number)
+    .map(ii => lyItemRowHtml(ck, si, ii, sec.sections[si].items[ii], lbl, ea, eb)).join('');
+}
+
+function lyItem(ck, si, ii) { const s = LAYER_SECTIONS[ck]; return s && s.sections[si] && s.sections[si].items[ii]; }
+
+function lyItemToggle(ck, si, ii) {
+  const row = document.getElementById('lyi_' + safeId(ck) + '_' + si + '_' + ii);
+  if (!row) return;
+  row.classList.toggle('open');
+  const body = row.querySelector('.fn-body');
+  if (body.dataset.filled === '1') return;
+  body.dataset.filled = '1';
+  const it = lyItem(ck, si, ii), ea = LAST_RUN.profileA, eb = LAST_RUN.profileB;
+  if (it.status !== 'changed') { body.innerHTML = pre(it.a || it.b); return; }
+  const rows = it.fields.map(f => `<tr class="changed"><td>${esc(f.path)}</td><td class="va">${esc(f.a ?? '—')}</td><td class="vb">${esc(f.b ?? '—')}</td></tr>`).join('');
+  const more = it.fieldCount > it.fields.length ? `<div class="only-info">${it.fieldCount - it.fields.length} more — use Diff</div>` : '';
+  body.innerHTML = `<table class="meta-tbl"><thead><tr><th>Path</th><th>A (control) ${esc(ea)}</th><th>B ${esc(eb)}</th></tr></thead><tbody>${rows}</tbody></table>${more}`;
+}
+
+function lyItemDiff(ck, si, ii) {
+  const it = lyItem(ck, si, ii); if (!it) return;
+  const name = String(it.key).replace(/[^a-zA-Z0-9._-]/g, '_').slice(-80) + '.json';
+  sendDiff(it.a || '', it.b || '', name, LAST_RUN.profileA, LAST_RUN.profileB, ck);
+}
+
+function lyJsonInit(ck) {
+  const el = document.getElementById('js_' + safeId(ck));
+  if (!el || el.dataset.done) return;
+  el.dataset.done = '1';
+  const c = LAYER_CONTENT_CACHE[ck];
+  if (!c || c.loading || c.error) { el.textContent = 'Not loaded'; return; }
+  el.className = '';
+  el.innerHTML = sideBySide(c.normA || '', c.normB || '', LAST_RUN.profileA, LAST_RUN.profileB);
+}
+
+// ── Wireframe ────────────────────────────────────────────────────────────────
+
+// A (left) is the control: only-a = deleted in B, only-b = added in B.
+// Value: { st: 'changed'|'deleted'|'added'|'struct', fields: [changed paths] }.
+function lyStatusMap(ck) {
+  const m = {};
+  const sec = LAYER_SECTIONS[ck];
+  const st = { changed: 'changed', 'only-a': 'deleted', 'only-b': 'added' };
+  for (const s of (sec ? sec.sections : [])) {
+    if (s.name !== 'Pages' && s.name !== 'Layout') continue;
+    for (const it of s.items) {
+      m[it.key] = { st: it.status === 'changed' && it.structural ? 'struct' : st[it.status],
+        fields: (it.fields || []).filter(f => !f.path.includes('@child')).map(f => f.path) };
+    }
+  }
+  return m;
+}
+
+// Layers tab vocabulary/colours (A = control).
+const LY_WORD = { changed: 'CHANGED', 'only-a': 'DELETED', 'only-b': 'ADDED', 'in-both': 'BOTH' };
+const LY_COLOR = { changed: '#d9a400', 'only-a': '#e5534b', 'only-b': 'var(--c-match)', 'in-both': 'var(--vscode-descriptionForeground)' };
+
+// ── Kinetic-style preview ────────────────────────────────────────────────────
+// Re-draws the layer's component tree the way Kinetic lays it out: metafx-div
+// rows of metafx-col columns (flexBasis), panel cards with header controls,
+// grids with their real columns, tab strips that switch pages, floating-label
+// inputs. Light canvas regardless of the VS Code theme. Diff status is drawn
+// as an outline on top of each component.
+
+let LY_VIEW = {};   // ck -> 'both' | 'a' | 'b'
+let LY_PAGE = {};   // ck -> current page key
+let LY_TAB = {};    // ck::tabstripKey -> selected page
+// Bindings and hidden components are shown. Differences: only the changed
+// control gets a yellow border, on the B side (A is the control); controls
+// deleted in B keep a dashed yellow border on the A side. No tints.
+const LY_OPTS = { diff: true, bind: true, hidden: true };
+
+const KIN_ICON = {
+  search: '<svg viewBox="0 0 16 16" class="kin-ic"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.4 10.4 14 14" stroke="currentColor" stroke-width="1.6"/></svg>',
+  combo: '<svg viewBox="0 0 16 16" class="kin-ic"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+  date: '<svg viewBox="0 0 16 16" class="kin-ic"><rect x="2.5" y="3.5" width="11" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" stroke="currentColor" stroke-width="1.3"/></svg>',
+  time: '<svg viewBox="0 0 16 16" class="kin-ic"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 5v3.3l2.2 1.4" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>',
+  chev: '<svg viewBox="0 0 16 16" class="kin-ic"><path d="M5 10l3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+  more: '<svg viewBox="0 0 16 16" class="kin-ic"><circle cx="8" cy="3.5" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="12.5" r="1.3" fill="currentColor"/></svg>',
+  full: '<svg viewBox="0 0 16 16" class="kin-ic"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>',
+  plus: '<svg viewBox="0 0 16 16" class="kin-ic"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6"/></svg>',
+  prev: '<svg viewBox="0 0 16 16" class="kin-ic"><path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+  next: '<svg viewBox="0 0 16 16" class="kin-ic"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+};
+
+const KIN_FIELD = {
+  'erp-text-box': 'text', 'ep-text-box': 'text', 'ep-masked-text-box': 'text', 'erp-part-rev-desc': 'partrev',
+  'erp-numeric-box': 'number', 'ep-numeric-box': 'number', 'erp-currency-box': 'currency', 'erp-currency-child-box': 'currency',
+  'erp-date-picker': 'date', 'ep-date-picker': 'date', 'ep-date-time-picker': 'date', 'erp-time-picker': 'time', 'ep-time-picker': 'time',
+  'erp-combo-box': 'combo', 'ep-combo-box': 'combo', 'erp-link-combo-box': 'combo', 'ep-dropdown': 'combo', 'ep-multi-select': 'combo',
+  'erp-currency-selector': 'combo', 'erp-printer-selector': 'combo', 'erp-gl-account-editor': 'text', 'erp-gl-multibook-account-editor': 'text',
+  'erp-text-area': 'area', 'ep-text-area': 'area', 'erp-rich-text-editor': 'area', 'ep-rich-text-editor': 'area', 'erp-qty-uom': 'qtyuom',
+  'erp-file-box': 'text', 'erp-server-file-box': 'text', 'erp-server-folder-box': 'text', 'erp-token-date': 'date',
+};
+
+function kinStatus(n, cx) {
+  const e = cx.sm[n.key];
+  if (!e || e.st === 'struct') return null;
+  if (cx.side === 'b' && (e.st === 'changed' || e.st === 'added')) return e;
+  if (cx.side === 'a' && e.st === 'deleted') return e;
+  return null;
+}
+
+function kinStatusCls(n, cx) {
+  const e = kinStatus(n, cx);
+  return !e ? '' : e.st === 'deleted' ? ' kin-del' : ' kin-ch';
+}
+
+function kinWrapAttrs(n, cx, extraCls) {
+  const p = n.props || {};
+  const hid = p.hidden === true || p.hidden === 'true';
+  const e = kinStatus(n, cx);
+  const what = !e ? '' : e.st === 'added' ? ' | ADDED in B' : e.st === 'deleted' ? ' | DELETED in B'
+    : ' | CHANGED: ' + e.fields.slice(0, 8).map(f => f.replace(/^model\./, '')).join(', ') + (e.fields.length > 8 ? ', ...' : '');
+  const tip = n.type + ' | ' + n.id + (n.binding ? ' | ' + n.binding : '') + (hid ? ' | hidden' : '') + what;
+  return `class="${extraCls}${kinStatusCls(n, cx)}${hid ? ' kin-hidden' : ''}" title="${esc(tip)}"`;
+}
+
+function kinField(n, cx, kind) {
+  const p = n.props || {};
+  const label = p.labelText || n.label || n.id;
+  const ro = p.readonly === true || p.disabled === true;
+  const value = n.binding && LY_OPTS.bind ? `<span class="kin-bind">${esc(n.binding)}</span>` : '';
+  const right = kind === 'number' ? '<span class="kin-num">0</span>' : kind === 'currency' ? '<span class="kin-num">0.00</span>' : '';
+  let icon = '';
+  if (kind === 'combo') icon = KIN_ICON.combo;
+  else if (kind === 'date') icon = KIN_ICON.date;
+  else if (kind === 'time') icon = KIN_ICON.time;
+  else if (p.isKeyField === true || p.enableSearch === true) icon = KIN_ICON.search;
+  const req = p.required === true ? '<span class="kin-req">*</span>' : '';
+  const box = (lbl, val, ic, cls) => `<div class="kin-input${cls || ''}${ro ? ' kin-ro' : ''}"><div class="kin-flabel">${esc(lbl)}${req}</div><div class="kin-val">${val}</div>${ic ? `<div class="kin-icon">${ic}</div>` : ''}</div>`;
+  if (kind === 'partrev') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-field kin-multi')}>${box('Part', value, KIN_ICON.search)}${box('Rev', '', KIN_ICON.combo, ' kin-narrow')}${box('Description', '', '')}</div>`;
+  }
+  if (kind === 'qtyuom') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-field kin-multi')}>${box(label, value + '<span class="kin-num">0</span>', '')}${box('UOM', '', KIN_ICON.combo, ' kin-narrow')}</div>`;
+  }
+  return `<div ${kinWrapAttrs(n, cx, 'kin-field')}>${box(label, value + right, icon, kind === 'area' ? ' kin-area' : '')}</div>`;
+}
+
+function kinKids(n, cx, slot) {
+  return (n.children || []).filter(c => (c.slot || 'body') === slot).map(c => kinNode(c, cx)).join('');
+}
+
+function kinPanelHeader(n, cx, title) {
+  const p = n.props || {};
+  const collapsed = p.expanded === false;
+  return `<div class="kin-card-hdr"><span class="kin-chev${collapsed ? ' kin-collapsed' : ''}">${KIN_ICON.chev}</span>
+    <span class="kin-card-title">${esc(title || '')}</span>
+    <span class="kin-card-hdr-items">${kinKids(n, cx, 'header')}</span></div>`;
+}
+
+function kinFull(p) {
+  return p.fullScreenButtonVisible === false ? '' : `<div class="kin-fullscreen"><span>${KIN_ICON.full}Full Screen</span></div>`;
+}
+
+function kinGrid(n, cx) {
+  const p = n.props || {};
+  const cols = (p.gridColumns && p.gridColumns.length ? p.gridColumns : ['(columns from provider)']);
+  const head = cols.map(c => `<th>${esc(c)}</th>`).join('');
+  const row = cols.map(() => '<td></td>').join('');
+  return `<div class="kin-grid-tools"><span class="kin-tool">${KIN_ICON.plus}</span><span class="kin-gsearch">${KIN_ICON.search}<span>Search...</span></span></div>
+    <div class="kin-grid-scroll"><table class="kin-grid"><thead><tr><th class="kin-gsel"></th>${head}</tr></thead>
+    <tbody><tr><td class="kin-gsel"></td>${row}</tr><tr><td class="kin-gsel"></td>${row}</tr><tr><td class="kin-gsel"></td>${row}</tr></tbody></table></div>
+    ${n.binding && LY_OPTS.bind ? `<div class="kin-grid-foot">${esc(n.binding)}</div>` : ''}`;
+}
+
+function kinNode(n, cx) {
+  if (!n || cx.depth > 40) return '';
+  cx = { ...cx, depth: cx.depth + 1 };
+  const p = n.props || {}, t = n.type;
+  if ((p.hidden === true || p.hidden === 'true') && !LY_OPTS.hidden) return '';
+  const heading = txt => txt && String(txt).trim() ? `<div class="kin-group-lbl">${esc(txt)}</div>` : '';
+
+  if (t === 'metafx-panel-card' || t === 'ep-panel-card' || t === 'metafx-panel-card-classic' || t === 'ep-group-box') {
+    const collapsed = p.expanded === false;
+    return `<div ${kinWrapAttrs(n, cx, 'kin-card' + (collapsed ? ' kin-collapsed-card' : ''))}>${kinPanelHeader(n, cx, p.title || p.labelText || '')}
+      ${collapsed ? '' : `<div class="kin-card-body">${kinKids(n, cx, 'body')}${kinKids(n, cx, 'ext')}</div>${kinFull(p)}`}</div>`;
+  }
+  if (t === 'metafx-panel-card-grid' || t === 'ep-panel-card-grid' || t === 'erp-grid' || t === 'ep-grid') {
+    const collapsed = p.expanded === false;
+    return `<div ${kinWrapAttrs(n, cx, 'kin-card' + (collapsed ? ' kin-collapsed-card' : ''))}>${kinPanelHeader(n, cx, p.title || p.labelText || '')}
+      ${collapsed ? '' : `<div class="kin-card-body kin-card-grid">${kinGrid(n, cx)}${kinKids(n, cx, 'body')}</div>${kinFull(p)}`}</div>`;
+  }
+  if (t === 'metafx-panel-card-stack' || t === 'ep-panel-card-stack') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-stack')}>${kinKids(n, cx, 'body')}</div>`;
+  }
+  if (t === 'metafx-div') {
+    const kids = (n.children || []).filter(c => c.slot !== 'header');
+    const cols = kids.map(c => c.type === 'metafx-col' ? kinNode(c, cx) : `<div class="kin-col" style="flex-basis:100%;max-width:100%">${kinNode(c, cx)}</div>`).join('');
+    return `<div ${kinWrapAttrs(n, cx, 'kin-div')}>${heading(p.labelText)}<div class="kin-row${p.orientation === 'horizontal' ? ' kin-horiz' : ''}">${cols}</div></div>`;
+  }
+  if (t === 'metafx-col') {
+    const fb = String(p.flexBasis || '100%');
+    return `<div ${kinWrapAttrs(n, cx, 'kin-col')} style="flex-basis:${esc(fb)};max-width:${esc(fb)}">${heading(p.labelText)}${kinKids(n, cx, 'body')}</div>`;
+  }
+  if (t === 'metafx-flex-box' || t === 'ep-flex-box') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-div')}>${heading(p.labelText)}<div class="kin-flex">${kinKids(n, cx, 'body')}</div></div>`;
+  }
+  if (t === 'metafx-tabstrip' || t === 'ep-tab-strip') {
+    const tabs = p.tabs || [];
+    const tk = cx.ck + '::' + n.key;
+    const sel = LY_TAB[tk] || (tabs.find(x => x.selected) || tabs[0] || {}).page;
+    const bar = tabs.map(tb => `<span class="kin-tab${tb.page === sel ? ' kin-tab-on' : ''}" onclick="kinTab('${jsAttr(cx.ck)}','${jsAttr(tk)}','${jsAttr(tb.page)}')">${esc(tb.title)}</span>`).join('');
+    const page = cx.pages[sel];
+    const body = page && !cx.seen.has(sel)
+      ? kinPageBody(page, { ...cx, seen: new Set([...cx.seen, sel]) })
+      : `<div class="kin-empty">${sel ? 'Page ' + esc(sel) + ' not in this environment' : ''}</div>`;
+    return `<div ${kinWrapAttrs(n, cx, 'kin-tabstrip')}><div class="kin-tabs">${bar}</div><div class="kin-tab-body">${body}</div></div>`;
+  }
+  if (KIN_FIELD[t]) return kinField(n, cx, KIN_FIELD[t]);
+  if (t === 'erp-check-box' || t === 'ep-check-box' || t === 'ep-switch') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-field kin-check')}><span class="kin-cb${p.readonly ? ' kin-ro' : ''}"></span><span class="kin-cb-lbl">${esc(p.labelText || n.label)}</span></div>`;
+  }
+  if (t === 'erp-radio-button' || t === 'ep-radio-button') {
+    const opts = p.options && p.options.length ? p.options : [p.labelText || n.label];
+    return `<div ${kinWrapAttrs(n, cx, 'kin-field kin-radios')}>${opts.map((o, i) => `<span class="kin-radio"><span class="kin-rb${i === 0 ? ' kin-rb-on' : ''}"></span>${esc(o)}</span>`).join('')}</div>`;
+  }
+  if (t === 'erp-button' || t === 'ep-button' || t === 'ep-dropdown-button') {
+    return `<span ${kinWrapAttrs(n, cx, 'kin-btn')}>${esc(p.labelText || n.label)}</span>`;
+  }
+  if (t === 'erp-shape') {
+    const tone = { 1: 'ok', 2: 'warn', 3: 'err' }[p.status] || 'info';
+    return `<span ${kinWrapAttrs(n, cx, 'kin-shape kin-shape-' + tone)}><span class="kin-shape-lbl">${esc(p.enabledCaption || p.labelText || n.id)}</span></span>`;
+  }
+  if (t === 'erp-tag' || t === 'ep-tag' || t === 'ep-badge' || t === 'ep-status') {
+    return `<span ${kinWrapAttrs(n, cx, 'kin-shape')}><span class="kin-shape-lbl">${esc(p.trueCaption || p.labelText || n.label)}</span></span>`;
+  }
+  if (t === 'ep-label') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-label')}>${esc(p.labelText || n.label)}</div>`;
+  }
+  if (t === 'ep-row-navigator') {
+    return `<div ${kinWrapAttrs(n, cx, 'kin-field kin-rownav')}><div class="kin-input"><div class="kin-flabel">${esc(p.labelText || n.label)}</div>
+      <div class="kin-val">${LY_OPTS.bind ? `<span class="kin-bind">${esc((p.navColumns || []).join(', ') || n.binding)}</span>` : ''}</div>
+      <div class="kin-icon">${KIN_ICON.prev}<span class="kin-navtxt">1 of 1</span>${KIN_ICON.next}</div></div></div>`;
+  }
+  // Unknown component: keep its place, show what it is.
+  const kids = (n.children || []).map(c => kinNode(c, cx)).join('');
+  return `<div ${kinWrapAttrs(n, cx, 'kin-unknown')}><div class="kin-unknown-lbl">${esc(n.label || n.id)} <span>${esc(t)}</span></div>${kids}</div>`;
+}
+
+function kinPageBody(page, cx) {
+  return page.roots.map(r => kinNode(r, cx)).join('') || '<div class="kin-empty">Empty page</div>';
+}
+
+function kinTab(ck, tk, page) {
+  LY_TAB[tk] = page;
+  lyWireRender(ck, LY_PAGE[ck]);
+}
+
+function lyWireInit(ck) {
+  const el = document.getElementById('wf_' + safeId(ck));
+  if (!el || el.dataset.done) return;
+  const sec = LAYER_SECTIONS[ck];
+  if (!sec) { el.textContent = 'Not loaded'; return; }
+  el.dataset.done = '1';
+  const sm = lyStatusMap(ck);
+  const pageKeys = [...new Set([...(sec.wireA || []).map(p => p.key), ...(sec.wireB || []).map(p => p.key)])];
+  const changedPages = new Set(Object.keys(sm).map(k => k.split(' / ')[0]));
+  // Main (tab host) first, then pages with changes, then the rest.
+  const rank = k => (k === 'Main' ? 0 : changedPages.has(k) ? 1 : 2);
+  pageKeys.sort((x, y) => rank(x) - rank(y) || x.localeCompare(y));
+  const both = !!LAYER_OBJECTS[ck + '::a'] && !!LAYER_OBJECTS[ck + '::b'];
+  LY_VIEW[ck] = LY_VIEW[ck] || (both ? 'both' : (LAYER_OBJECTS[ck + '::a'] ? 'a' : 'b'));
+  el.className = '';
+  el.innerHTML = `<div class="wf-bar">Page <select id="wfp_${safeId(ck)}" onchange="lyWireRender('${jsAttr(ck)}',this.value)">${pageKeys.map(k =>
+      `<option value="${esc(k)}">${esc(k)}${changedPages.has(k) ? ' (changed)' : ''}</option>`).join('')}</select>
+      ${both ? `<span class="kin-viewsw">${['both', 'a', 'b'].map(v => `<span class="kin-vs${LY_VIEW[ck] === v ? ' on' : ''}" data-v="${v}" onclick="kinView('${jsAttr(ck)}','${v}')">${v === 'both' ? 'Side by side' : esc(v === 'a' ? LAST_RUN.profileA : LAST_RUN.profileB)}</span>`).join('')}</span>` : ''}
+      <span class="wf-legend"><i class="kin-lg-ch"></i>changed / added in B <i class="kin-lg-del"></i>deleted in B | hover a control for what changed</span></div>
+    <div id="wfv_${safeId(ck)}"></div>`;
+  if (pageKeys.length) lyWireRender(ck, pageKeys[0]);
+}
+
+function kinView(ck, v) {
+  LY_VIEW[ck] = v;
+  document.querySelectorAll('#wf_' + safeId(ck) + ' .kin-vs').forEach(x => x.classList.toggle('on', x.dataset.v === v));
+  lyWireRender(ck, LY_PAGE[ck]);
+}
+
+function lyWireRender(ck, pageKey) {
+  const sec = LAYER_SECTIONS[ck], el = document.getElementById('wfv_' + safeId(ck));
+  if (!sec || !el) return;
+  LY_PAGE[ck] = pageKey;
+  const sel = document.getElementById('wfp_' + safeId(ck)); if (sel && sel.value !== pageKey) sel.value = pageKey;
+  const sm = LY_OPTS.diff ? lyStatusMap(ck) : {};
+  const col = (pages, label, side) => {
+    const map = {}; for (const p of pages || []) map[p.key] = p;
+    const p = map[pageKey];
+    const cx = { sm, pages: map, ck, depth: 0, seen: new Set([pageKey]), side };
+    return `<div class="kin-col-wrap"><div class="diff-col-hdr kin-side">${esc(label)}${p ? ' - ' + esc(p.caption) : ''}</div>
+      <div class="kin-canvas">${p ? kinPageBody(p, cx) : '<div class="kin-empty">Page not in this environment</div>'}</div></div>`;
+  };
+  const v = LY_VIEW[ck] || 'both';
+  const parts = [];
+  if (v === 'both' || v === 'a') parts.push(col(sec.wireA, 'A (control): ' + LAST_RUN.profileA, 'a'));
+  if (v === 'both' || v === 'b') parts.push(col(sec.wireB, 'B: ' + LAST_RUN.profileB, 'b'));
+  el.innerHTML = `<div class="${parts.length > 1 ? 'wf-grid' : 'kin-single'}">${parts.join('')}</div>`;
+}
+
+// ── BPM flow diagram (SVG, no library) ───────────────────────────────────────
+// Positions come from the designer (ElementX/ElementY); when a body has none,
+// nodes are laid out by depth from the start node. Node status compares the
+// same walk-order number on the other side.
+
+function bpmFlowStatus(g, other, selfIsA) {
+  const m = {};
+  for (const n of (g && g.nodes) || []) {
+    const o = other && other.nodes ? other.nodes.find(x => x.n === n.n) : null;
+    if (selfIsA) m[n.n] = o ? '' : 'del';
+    else m[n.n] = !o ? 'changed' : (o.widget === n.widget && o.sig === n.sig ? '' : 'changed');
+  }
+  return m;
+}
+
+function bpmWidgetShort(w) {
+  return String(w || '').replace(/Action2?$/, '').replace(/Condition$/, ' Cond').replace(/([a-z])([A-Z])/g, '$1 $2');
+}
+
+function bpmFlowSvg(g, sm) {
+  if (!g || !g.nodes || !g.nodes.length) return '<div class="only-info">No widget graph</div>';
+  const W = 176, H = 46, SW = 72, SH = 30;
+  const pos = new Map();
+  if (g.nodes.some(n => n.x || n.y)) {
+    // Designer boxes are much smaller than ours: spread the coordinates until
+    // no two boxes overlap (keeps the designer's arrangement, just scaled).
+    let need = 1;
+    for (let i = 0; i < g.nodes.length; i++) for (let j = i + 1; j < g.nodes.length; j++) {
+      const a = g.nodes[i], c = g.nodes[j];
+      const fit = Math.max(Math.abs(a.x - c.x) / (W + 24), Math.abs(a.y - c.y) / (H + 24));
+      if (fit > 0 && fit < 1) need = Math.max(need, 1 / fit);
+    }
+    const k = Math.min(need, 4);
+    for (const n of g.nodes) pos.set(n.n, { x: n.x * k, y: n.y * k, w: W, h: H });
+  } else {
+    const depth = new Map([[g.nodes[0].n, 0]]), q = [g.nodes[0].n];
+    while (q.length) {
+      const c = q.shift();
+      for (const e of g.edges) if (e.from === c && e.to != null && !depth.has(e.to)) { depth.set(e.to, depth.get(c) + 1); q.push(e.to); }
+    }
+    const rows = {};
+    for (const n of g.nodes) {
+      const d = depth.has(n.n) ? depth.get(n.n) : 0;
+      rows[d] = (rows[d] || 0) + 1;
+      pos.set(n.n, { x: d * (W + 80), y: (rows[d] - 1) * (H + 50), w: W, h: H });
+    }
+  }
+  // Start marker, up-left of the first node (the designer keeps its own spot
+  // for it, which neither body format exposes).
+  const first = pos.get(g.nodes[0].n);
+  pos.set('start', { x: first.x - SW - 60, y: first.y - SH - 40, w: SW, h: SH });
+  const edgesIn = [{ from: 'start', to: g.nodes[0].n, label: '' }, ...g.edges];
+
+  const all = [...pos.values()];
+  const minX = Math.min(...all.map(p => p.x)), minY = Math.min(...all.map(p => p.y)), PAD = 30;
+  for (const p of all) { p.x = p.x - minX + PAD; p.y = p.y - minY + PAD; }
+  const width = Math.max(...all.map(p => p.x + p.w)) + PAD + 90;
+  const height = Math.max(...all.map(p => p.y + p.h)) + PAD + 30;
+
+  // Port routing: leave/enter on the side facing the other box.
+  const port = (p, side, shift) => side === 'r' ? [p.x + p.w, p.y + p.h / 2 + shift] : side === 'l' ? [p.x, p.y + p.h / 2 + shift]
+    : side === 'b' ? [p.x + p.w / 2 + shift, p.y + p.h] : [p.x + p.w / 2 + shift, p.y];
+  const dirv = { r: [1, 0], l: [-1, 0], b: [0, 1], t: [0, -1] };
+  let edges = '', labels = '';
+  for (const e of edgesIn) {
+    const a = pos.get(e.from); if (!a) continue;
+    const shift = e.label === 'True' ? -10 : e.label === 'False' ? 10 : 0;
+    const b = e.to != null ? pos.get(e.to) : null;
+    if (!b) {
+      if (!e.label) continue;
+      const [x1, y1] = port(a, 'r', shift);
+      edges += `<path d="M${x1},${y1} h16" class="bf-edge bf-end" />`;
+      labels += `<text x="${x1 + 20}" y="${y1 + 3}" class="bf-elbl">${esc(e.label)}: end</text>`;
+      continue;
+    }
+    const dx = (b.x + b.w / 2) - (a.x + a.w / 2), dy = (b.y + b.h / 2) - (a.y + a.h / 2);
+    const vertical = Math.abs(dy) > Math.abs(dx) * 0.6;
+    const sa = vertical ? (dy > 0 ? 'b' : 't') : (dx > 0 ? 'r' : 'l');
+    const sb = vertical ? (dy > 0 ? 't' : 'b') : (dx > 0 ? 'l' : 'r');
+    const [x1, y1] = port(a, sa, shift), [x2, y2] = port(b, sb, 0);
+    const k = Math.max(30, Math.min(120, (vertical ? Math.abs(dy) : Math.abs(dx)) / 2));
+    const c1 = [x1 + dirv[sa][0] * k, y1 + dirv[sa][1] * k], c2 = [x2 + dirv[sb][0] * k, y2 + dirv[sb][1] * k];
+    edges += `<path d="M${x1},${y1} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${x2},${y2}" class="bf-edge" marker-end="url(#bfArrow)" />`;
+    if (e.label) labels += `<text x="${x1 + dirv[sa][0] * 6 + (vertical ? 4 : 0)}" y="${y1 + dirv[sa][1] * 12 + (vertical ? 0 : -4)}" class="bf-elbl">${esc(e.label)}</text>`;
+  }
+  const s = pos.get('start');
+  let nodes = `<g class="bf-node bf-start"><rect x="${s.x}" y="${s.y}" width="${s.w}" height="${s.h}" rx="4" /><text x="${s.x + s.w / 2}" y="${s.y + 19}" class="bf-t1" text-anchor="middle">Start</text></g>`;
+  for (const n of g.nodes) {
+    const p = pos.get(n.n), st = sm[n.n] || '';
+    const label = (n.label || '').length > 26 ? n.label.slice(0, 25) + '...' : (n.label || '');
+    nodes += `<g class="bf-node bf-${n.kind}${st ? ' bf-' + st : ''}"><title>${esc('[' + n.n + '] ' + n.widget + (n.label ? ' - ' + n.label : '') + '\n\n' + String(n.sig || '').slice(0, 1200))}</title>
+      <rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="${n.kind === 'condition' ? 14 : 4}" />
+      <text x="${p.x + 8}" y="${p.y + 18}" class="bf-t1">[${n.n}] ${esc(bpmWidgetShort(n.widget))}</text>
+      ${label ? `<text x="${p.x + 8}" y="${p.y + 34}" class="bf-t2">${esc(label)}</text>` : ''}
+    </g>`;
+  }
+  return `<svg class="bf-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    <defs><marker id="bfArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="bf-arrow" /></marker></defs>
+    ${edges}${nodes}${labels}</svg>`;
+}
+
+function bpmFlowHtml(d, ea, eb) {
+  const col = (e, other, isA, label) => `<div><div class="diff-col-hdr kin-side">${esc(label)}</div>
+    <div class="bf-wrap">${e ? bpmFlowSvg(e.graph, bpmFlowStatus(e.graph, other && other.graph, isA)) : `<div class="only-info">${isA ? 'Not in ' + esc(ea) + ' (added in B)' : 'Not in ' + esc(eb) + ' (deleted in B)'}</div>`}</div></div>`;
+  return `<div class="wf-bar"><span class="wf-legend"><i class="kin-lg-ch"></i>changed / added in B <i class="kin-lg-del"></i>deleted in B | hover a node for its settings/code</span></div>
+    <div class="wf-grid">${col(d.a, d.b, true, 'A (control): ' + ea)}${col(d.b, d.a, false, 'B: ' + eb)}</div>`;
+}

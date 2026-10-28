@@ -243,6 +243,23 @@ class EpicorClient {
         };
     }
 
+    // Replace an EfxFunction's whole Body — the widget-flow XAML of a
+    // widget-based function, which the Code/Usings save path can't express.
+    // Raw-string patching keeps every SysRevID int64 in the tableset intact.
+    async saveFunctionBody(libraryId, functionId, newBody) {
+        const rawTableset = await this.getLibraryRaw(libraryId);
+        const patched = this._patchFunctionBody(rawTableset, functionId, newBody, 'U');
+        const { diagnostics } = await this.applyChangesRaw(patched);
+
+        const errors = (diagnostics || []).filter(d =>
+            typeof d === 'object' ? (d.Severity ?? 2) >= 2 : /\berror\b/i.test(String(d))
+        );
+        if (errors.length) {
+            throw new Error(errors.map(d => (typeof d === 'object' ? d.Message || JSON.stringify(d) : String(d))).join('; '));
+        }
+        return { diagnostics: diagnostics || [] };
+    }
+
     async promoteToProduction(libraryId) {
         await this.request(this.getDesignerUrl('PromoteToProduction'), {
             libraryID: libraryId
