@@ -477,10 +477,99 @@ function activate(context) {
             }
         });
     }));
-    // -- Pull every function in a library into the storage folder --
-    // Same layout and header as Pull Function (<storage>/<profile>/Libraries/<lib>/).
+    // -- Pull functions into the storage folder --------------------------------
+    // Same layout and header as Pull Function: <storage>/<profile>/Libraries/<lib>/.
     // Code functions -> <fn>.cs (pushable as usual). Widget flows -> <fn>.widgets.txt,
     // a read-only canonical view of the flow (nodes, settings, code inline).
+    const PULL_SEP = "// --------------------------------------------------";
+
+    // Tableset of one library -> files to write (pure; no disk, no UI).
+    function buildLibraryFiles(libraryId, tableset, stamp) {
+        const { directiveToCanonicalText } = require("./widgetXaml");
+        const files = [], skipped = [];
+        for (const fn of (tableset && tableset.EfxFunction) || []) {
+            if (fn.LibraryID && fn.LibraryID !== libraryId) continue;
+            const functionId = fn.FunctionID;
+            const body = efxBody_1.describeBody(fn.Body);
+            if (body.unparsedFlow) {
+                skipped.push(`${libraryId}.${functionId} (widget body this extension can't read)`);
+                continue;
+            }
+            if (body.kind === "flow" && !body.flow.onlyCustomCode) {
+                const header = [`// EFx Function: ${libraryId}.${functionId}`, `// Pulled: ${stamp}`,
+                    "// Widget flow — read-only view; edit in the widget panel", PULL_SEP, ""].join("\n");
+                files.push({ libraryId, functionId, file: `${functionId}.widgets.txt`, pushable: false,
+                    content: header + "\n" + (directiveToCanonicalText(body.xaml) || body.xaml) });
+                continue;
+            }
+            const widgetNodeId = body.kind === "flow" ? body.flow.codeNodes[0].id : null;
+            const code = widgetNodeId ? body.flow.codeNodes[0].code : body.code;
+            const usings = body.usings;
+            const header = [
+                `// EFx Function: ${libraryId}.${functionId}`,
+                `// Pulled: ${stamp}`,
+                usings ? `// Usings: ${usings}` : "",
+                widgetNodeId ? `// Widget: ${widgetNodeId}` : "",
+                PULL_SEP,
+                "",
+            ].filter(l => l !== "").join("\n");
+            files.push({ libraryId, functionId, file: `${functionId}.cs`, pushable: true, widgetNodeId,
+                content: header.replace(/\s*$/, "") + "\n\n" + code });
+        }
+        return { files, skipped };
+    }
+
+    // Write pulled files under efxDir/<lib>/. Never clobbers local work: open
+    // files with unsaved edits are skipped; saved files whose code differs from
+    // Epicor are asked about once. Returns { written, skipped } or null if cancelled.
+    async function writePulledFiles(efxDir, files, skipped) {
+        const codeOnly = text => {
+            const t = String(text).replace(/\r\n/g, "\n");
+            const i = t.indexOf(PULL_SEP);
+            return (i >= 0 ? t.slice(t.indexOf("\n", i) + 1) : t).trim();
+        };
+        const pathOf = f => path.join(efxDir, f.libraryId, f.file);
+        const openDirty = new Set(vscode.workspace.textDocuments.filter(d => d.isDirty).map(d => normalizeFsPath(d.uri.fsPath)));
+        const dirty = files.filter(f => openDirty.has(normalizeFsPath(pathOf(f))));
+        for (const f of dirty) skipped.push(`${f.libraryId}.${f.functionId} (open with unsaved changes)`);
+        files = files.filter(f => !dirty.includes(f));
+        const differs = files.filter(f => {
+            const p = pathOf(f);
+            if (!fs.existsSync(p)) return false;
+            try { return codeOnly(fs.readFileSync(p, "utf-8")) !== codeOnly(f.content); } catch { return false; }
+        });
+        if (differs.length) {
+            const names = differs.map(f => `${f.libraryId}.${f.functionId}`);
+            const list = names.slice(0, 15).join(", ") + (names.length > 15 ? `, +${names.length - 15} more` : "");
+            const pick = await vscode.window.showWarningMessage(
+                `${differs.length} local file(s) differ from Epicor (unpushed edits?): ${list}`,
+                { modal: true }, "Overwrite", "Keep Local Copies");
+            if (!pick) return null;
+            if (pick === "Keep Local Copies") {
+                files = files.filter(f => !differs.includes(f));
+                for (const f of differs) skipped.push(`${f.libraryId}.${f.functionId} (kept local copy)`);
+            }
+        }
+        for (const f of files) {
+            const filePath = pathOf(f);
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, f.content, "utf-8");
+            if (f.pushable) fileMap.set(normalizeFsPath(filePath), { libraryId: f.libraryId, functionId: f.functionId, widgetNodeId: f.widgetNodeId });
+        }
+        return { written: files, skipped };
+    }
+
+    async function reportPull(what, result, revealDir) {
+        const { written, skipped } = result;
+        const libs = new Set(written.map(f => f.libraryId)).size;
+        const msg = `EFx: Pulled ${written.length} function(s) from ${what}${libs > 1 ? ` (${libs} libraries)` : ""}`
+            + (skipped.length ? ` — skipped ${skipped.length}: ${skipped.slice(0, 10).join("; ")}${skipped.length > 10 ? "; ..." : ""}` : "");
+        const act = await (skipped.length ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg, "Reveal in Finder", "Copy Path");
+        if (act === "Reveal in Finder") await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(revealDir));
+        else if (act === "Copy Path") await vscode.env.clipboard.writeText(revealDir);
+    }
+
+    // Right-click a library: just that library.
     context.subscriptions.push(vscode.commands.registerCommand("efx.pullLibrary", async (node) => {
         if (!client || !node?.library) {
             return;
@@ -491,89 +580,78 @@ function activate(context) {
             vscode.window.showWarningMessage("EFx: Storage location not set — pull cancelled.");
             return;
         }
-        const libDir = path.join(efxDir, libraryId);
-        const SEP = "// --------------------------------------------------";
-        const codeOnly = text => {
-            const t = String(text).replace(/\r\n/g, "\n");
-            const i = t.indexOf(SEP);
-            return (i >= 0 ? t.slice(t.indexOf("\n", i) + 1) : t).trim();
-        };
-        let files = [], skipped = [];
+        let built;
         try {
-            await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Pulling ${libraryId}...` }, async () => {
+            built = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Pulling ${libraryId}...` }, async () => {
                 treeProvider.invalidateCache(libraryId);
                 const tableset = await treeProvider.getLibraryTableset(libraryId);
                 if (!tableset) throw new Error(`Library ${libraryId} not found`);
                 pulledTablesets.set(libraryId, tableset);
-                const { directiveToCanonicalText } = require("./widgetXaml");
-                const stamp = new Date().toISOString();
-                for (const fn of tableset.EfxFunction || []) {
-                    const functionId = fn.FunctionID;
-                    const body = efxBody_1.describeBody(fn.Body);
-                    if (body.unparsedFlow) {
-                        skipped.push(`${functionId} (widget body this extension can't read)`);
-                        continue;
-                    }
-                    if (body.kind === "flow" && !body.flow.onlyCustomCode) {
-                        const header = [`// EFx Function: ${libraryId}.${functionId}`, `// Pulled: ${stamp}`,
-                            "// Widget flow — read-only view; edit in the widget panel", SEP, ""].join("\n");
-                        files.push({ functionId, file: `${functionId}.widgets.txt`, pushable: false,
-                            content: header + "\n" + (directiveToCanonicalText(body.xaml) || body.xaml) });
-                        continue;
-                    }
-                    const widgetNodeId = body.kind === "flow" ? body.flow.codeNodes[0].id : null;
-                    const code = widgetNodeId ? body.flow.codeNodes[0].code : body.code;
-                    const usings = body.usings;
-                    const header = [
-                        `// EFx Function: ${libraryId}.${functionId}`,
-                        `// Pulled: ${stamp}`,
-                        usings ? `// Usings: ${usings}` : "",
-                        widgetNodeId ? `// Widget: ${widgetNodeId}` : "",
-                        SEP,
-                        "",
-                    ].filter(l => l !== "").join("\n");
-                    files.push({ functionId, file: `${functionId}.cs`, pushable: true, widgetNodeId,
-                        content: header.replace(/\s*$/, "") + "\n\n" + code });
-                }
+                return buildLibraryFiles(libraryId, tableset, new Date().toISOString());
             });
         }
         catch (err) {
             vscode.window.showErrorMessage(`EFx Pull failed: ${err.message}`);
             return;
         }
+        const result = await writePulledFiles(efxDir, built.files, built.skipped);
+        if (result) await reportPull(libraryId, result, path.join(efxDir, libraryId));
+    }));
 
-        // Never clobber local work: an open file with unsaved edits is always
-        // skipped; a saved file whose code differs from Epicor is asked about.
-        const openDirty = new Set(vscode.workspace.textDocuments.filter(d => d.isDirty).map(d => normalizeFsPath(d.uri.fsPath)));
-        const dirty = files.filter(f => openDirty.has(normalizeFsPath(path.join(libDir, f.file))));
-        files = files.filter(f => !dirty.includes(f));
-        for (const f of dirty) skipped.push(`${f.functionId} (open with unsaved changes)`);
-        const differs = files.filter(f => {
-            const p = path.join(libDir, f.file);
-            if (!fs.existsSync(p)) return false;
-            try { return codeOnly(fs.readFileSync(p, "utf-8")) !== codeOnly(f.content); } catch { return false; }
-        });
-        if (differs.length) {
-            const pick = await vscode.window.showWarningMessage(
-                `${differs.length} local file(s) in ${libraryId} differ from Epicor (unpushed edits?): ${differs.map(f => f.functionId).join(", ")}`,
-                { modal: true }, "Overwrite", "Keep Local Copies");
-            if (!pick) return;
-            if (pick === "Keep Local Copies") {
-                files = files.filter(f => !differs.includes(f));
-                for (const f of differs) skipped.push(`${f.functionId} (kept local copy)`);
-            }
+    // Every library in the tree, in one go (bulk GetLibraries in chunks).
+    context.subscriptions.push(vscode.commands.registerCommand("efx.pullAllLibraries", async () => {
+        if (!client) {
+            vscode.window.showWarningMessage("EFx: Configure connection first");
+            return;
         }
-
-        fs.mkdirSync(libDir, { recursive: true });
-        for (const f of files) {
-            const filePath = path.join(libDir, f.file);
-            fs.writeFileSync(filePath, f.content, "utf-8");
-            if (f.pushable) fileMap.set(normalizeFsPath(filePath), { libraryId, functionId: f.functionId, widgetNodeId: f.widgetNodeId });
+        const efxDir = await getEfxDir();
+        if (!efxDir) {
+            vscode.window.showWarningMessage("EFx: Storage location not set — pull cancelled.");
+            return;
         }
-        const msg = `EFx: Pulled ${files.length} function(s) from ${libraryId}` + (skipped.length ? ` — skipped ${skipped.length}: ${skipped.join("; ")}` : "");
-        const act = await (skipped.length ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg, "Reveal in Finder", "Copy Path");
-        if (act === "Reveal in Finder") await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(libDir));
-        else if (act === "Copy Path") await vscode.env.clipboard.writeText(libDir);
+        const files = [], skipped = [];
+        let libCount = 0;
+        try {
+            const done = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Pulling all libraries", cancellable: true }, async (progress, token) => {
+                let libs = treeProvider.libraries && treeProvider.libraries.length ? treeProvider.libraries : await client.getLibraryList();
+                const ids = [...new Set(libs.map(l => l.LibraryID))].sort();
+                libCount = ids.length;
+                const stamp = new Date().toISOString();
+                const CHUNK = 20;
+                for (let i = 0; i < ids.length; i += CHUNK) {
+                    if (token.isCancellationRequested) return false;
+                    const chunk = ids.slice(i, i + CHUNK);
+                    progress.report({ message: `${Math.min(i + CHUNK, ids.length)} / ${ids.length} libraries`, increment: (chunk.length / ids.length) * 100 });
+                    let byLib = null;
+                    try {
+                        const raw = await client.request(client.getDesignerUrl("GetLibraries"), { libraryIds: chunk });
+                        const ts = raw && typeof raw === "object" ? (raw.returnObj || raw) : null;
+                        if (ts && Array.isArray(ts.EfxFunction)) {
+                            byLib = new Map(chunk.map(id => [id, { EfxFunction: [] }]));
+                            for (const fn of ts.EfxFunction) if (byLib.has(fn.LibraryID)) byLib.get(fn.LibraryID).EfxFunction.push(fn);
+                        }
+                    }
+                    catch { /* fall back to one call per library below */ }
+                    for (const id of chunk) {
+                        let ts = byLib ? byLib.get(id) : null;
+                        if (!ts) {
+                            try { ts = await client.getLibrary(id); }
+                            catch (e) { skipped.push(`${id} (could not load: ${e.message})`); continue; }
+                        }
+                        const built = buildLibraryFiles(id, ts, stamp);
+                        files.push(...built.files); skipped.push(...built.skipped);
+                    }
+                }
+                return true;
+            });
+            if (!done) { vscode.window.showInformationMessage("EFx: Pull all cancelled — nothing written."); return; }
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`EFx Pull failed: ${err.message}`);
+            return;
+        }
+        const result = await writePulledFiles(efxDir, files, skipped);
+        if (result) await reportPull(`all ${libCount} libraries`, result, efxDir);
     }));
     // -- Push Function --
     context.subscriptions.push(vscode.commands.registerCommand("efx.pushFunction", async (node, skipConfirm = false) => {
