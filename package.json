@@ -2,7 +2,7 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.8.1",
+	"version": "0.8.2",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -103,7 +103,13 @@
 			},
 			{
 				"command": "efx.pullLibrary",
-				"title": "Pull All Functions",
+				"title": "Pull This Library",
+				"icon": "$(cloud-download)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.pullAllLibraries",
+				"title": "Pull All Functions (All Libraries)",
 				"icon": "$(cloud-download)",
 				"category": "EFx"
 			},
@@ -297,8 +303,18 @@
 			],
 			"view/item/context": [
 				{
+					"command": "efx.pullAllLibraries",
+					"when": "view == efxLibraries && viewItem == library-promoted",
+					"group": "navigation@0"
+				},
+				{
 					"command": "efx.pullLibrary",
 					"when": "view == efxLibraries && viewItem == library-promoted",
+					"group": "navigation@0"
+				},
+				{
+					"command": "efx.pullAllLibraries",
+					"when": "view == efxLibraries && viewItem == library-unpromoted",
 					"group": "navigation@0"
 				},
 				{
