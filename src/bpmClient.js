@@ -248,6 +248,31 @@ function updateRawBpmDirective(rawTableset, directiveId, newCode) {
 }
 exports.updateRawBpmDirective = updateRawBpmDirective;
 
+// The "returnObj" object of a raw REST response, as a raw string. Unlike a
+// greedy regex this stops at the matching brace, so trailing "parameters"
+// (GetRowsEx's morePages) don't get swept in.
+function extractReturnObjRaw(raw) {
+    const key = raw.indexOf('"returnObj"');
+    if (key < 0) return null;
+    const start = raw.indexOf('{', key);
+    if (start < 0) return null;
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < raw.length; i++) {
+        const ch = raw[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') depth++;
+        else if (ch === '}' && --depth === 0) return raw.slice(start, i + 1);
+    }
+    return null;
+}
+exports.extractReturnObjRaw = extractReturnObjRaw;
+
 class BpmClient {
     constructor(epicorClient) {
         // Reuse the EpicorClient's transport — just need a different URL builder
@@ -291,22 +316,52 @@ class BpmClient {
     }
 
     // ── Get full tableset for one method ──
+    // GetByIDBpMethod answers "Record not found" for some methods GetRowsEx
+    // does list (seen on updatable-BAQ codes like Ice.CPI01/<query>.Update),
+    // so fall back to GetRowsEx filtered to the one method.
     async getBpmMethod(source, bpMethodCode) {
-        const result = await this.request(this.getBpmUrl('GetByIDBpMethod'), {
-            source,
-            bpMethodCode,
-        });
-        return result.returnObj;
+        try {
+            const result = await this.request(this.getBpmUrl('GetByIDBpMethod'), {
+                source,
+                bpMethodCode,
+            });
+            return result.returnObj;
+        } catch (err) {
+            if (!/record not found/i.test(err.message)) throw err;
+            const result = await this.request(this.getBpmUrl('GetRowsEx'), this._oneMethodQuery(source, bpMethodCode));
+            const ts = result.returnObj;
+            if (!ts || !(ts.BpMethod || []).length) throw err;
+            return ts;
+        }
     }
 
     // ── Get full tableset raw (preserves SysRevID int64) ──
     async getBpmMethodRaw(source, bpMethodCode) {
-        const raw = await this.requestRaw(
-            this.getBpmUrl('GetByIDBpMethod'),
-            JSON.stringify({ source, bpMethodCode })
-        );
-        const match = raw.match(/"returnObj"\s*:\s*(\{.*\})\s*\}$/s);
-        return match ? match[1] : raw;
+        try {
+            const raw = await this.requestRaw(
+                this.getBpmUrl('GetByIDBpMethod'),
+                JSON.stringify({ source, bpMethodCode })
+            );
+            const match = raw.match(/"returnObj"\s*:\s*(\{.*\})\s*\}$/s);
+            return match ? match[1] : raw;
+        } catch (err) {
+            if (!/record not found/i.test(err.message)) throw err;
+            const raw = await this.requestRaw(this.getBpmUrl('GetRowsEx'), JSON.stringify(this._oneMethodQuery(source, bpMethodCode)));
+            const ts = extractReturnObjRaw(raw);
+            if (!ts || !/"BpMethod":\[\s*\{/.test(ts)) throw err;
+            return ts;
+        }
+    }
+
+    _oneMethodQuery(source, bpMethodCode) {
+        const code = String(bpMethodCode).replace(/'/g, "''");
+        return {
+            source,
+            whereClauseBpMethod: `BpMethodCode = '${code}'`,
+            whereClauseBpDirective: `BpMethodCode = '${code}'`,
+            pageSize: 0,
+            absolutePage: 0,
+        };
     }
 
     // ── Update directives using raw JSON (preserves SysRevID int64) ──
