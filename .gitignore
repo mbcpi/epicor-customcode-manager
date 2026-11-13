@@ -35,3 +35,4 @@ node_modules/
 # MCP bundle build output
 mcp/dist/
 *.mcpb
+src/Claude outputs/
