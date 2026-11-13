@@ -1,5 +1,7 @@
 # Epicor EFx Manager
 
+![Epicor EFx Manager](images/hero.png)
+
 A VS Code extension for working with Epicor Kinetic EFx Function Libraries and BPM Directives directly from your editor — pull, edit, push, execute, and manage signatures without leaving VS Code.
 
 ![EFx Manager in action](screenshot.png)
@@ -81,17 +83,24 @@ EFx Explorer toolbar, pick a profile and company for each side, and run.
 
 ### 1. Install the Extension
 
-Install the `.vsix` file directly in VS Code via **Extensions → ··· → Install from VSIX**, or run:
+Install **Epicor EFx Manager** from the VS Code Marketplace, or download `epicor-efx-manager-<version>.vsix` from the [latest release](https://github.com/mbcpi/epicor-customcode-manager/releases/latest) and install it via **Extensions → ··· → Install from VSIX**, or run:
 
 ```
-code --install-extension epicor-efx-manager-0.6.0.vsix
+code --install-extension epicor-efx-manager-<version>.vsix
 ```
 
 ### 2. Install the Utilities Library in Epicor
 
 This extension relies on the **Utilities** EFx function library for saving code changes. You must install it in each Epicor environment you want to use the extension with.
 
-Download the `Utilities.efxb` library package from the release assets and import it via **Epicor → Function Library Maintenance → Import**. If you do not have access to the release, contact the publisher.
+The library is one function. Its code and setup steps are in [`EpicorLib/ApplyChangesWithDiagnostics.cs`](EpicorLib/ApplyChangesWithDiagnostics.cs) (also attached to each release). In **Function Library Maintenance**:
+
+1. Create a library named **Utilities** (code functions allowed).
+2. Add references — service `ICE:Lib:EfxLibraryDesigner`; assemblies `Ice.Contracts.Lib.EfxLibraryDesigner.dll` and `Newtonsoft.Json.dll`.
+3. Add a code function **ApplyChangesWithDiagnostics** with request parameters `inFunctionID` (System.String) and `inDS` (System.Data.DataSet), and response parameters `outMsg` (System.String), `outResult` (System.String), `outSuccess` (System.Boolean).
+4. Paste the code from the file (everything below its header), save, and **promote** the library.
+
+**Upgrading from 0.x:** replace the function's code with the 1.0.0 version. It adds batch saves (several functions in one compile — used by the Claude MCP server) and always re-promotes a library it had to demote. The extension still works with the old code; Claude's multi-function pushes then go one at a time.
 
 ### 3. Add Utilities to Your Access Scope
 
@@ -177,6 +186,69 @@ Expand any library's **Tables** group to see its table references. Hover a table
 
 ---
 
+## Using with Claude (MCP server)
+
+The `mcp/` folder holds an MCP server that lets Claude (Claude Desktop, and Cowork sessions linked to your computer) drive this extension: list, search, pull, compare, push, create/delete functions, references, signatures, execute, profiles, and (if allowed) promote/demote.
+
+**The extension still makes every Epicor call.** The MCP server never sees a password or API key — it writes a request file, the extension runs it, and the result file comes back to Claude as the tool result.
+
+### How a request travels
+
+1. Claude calls a tool. The MCP server writes `<profile folder>/_claude/<id>.json`.
+2. If VS Code is running, the extension's file watcher picks it up. If not, the MCP server opens `vscode://micah-bragg.epicor-efx-manager/request?id=<id>`, which starts VS Code and the extension.
+3. The extension claims the request (atomic rename, so only one window runs it), writes `<id>.ack.json`, runs it and writes `<id>.result.json`.
+4. The MCP server returns the result and deletes the request files.
+
+`~/.efx-manager/bridge.json` (written by the extension) tells the MCP server which profile is active, where its request folder is and what each profile allows. It contains no secrets.
+
+### Guards
+
+- **Per-profile access level** (`claudeAccess`), set only in **EFx: Manage Profiles → Edit Profile** — Claude can never change it, and profiles Claude creates start at `off`:
+
+  | Level | Allows |
+  |---|---|
+  | `off` (default) | nothing |
+  | `read` | list, get, search, pull to disk, list/pull BPM directives, compare profiles |
+  | `write` | + push functions/directives, new/delete function, new library, references, signatures, regenerate, execute, switch profile/company, create/edit/delete profiles |
+  | `risky` | + promote/demote libraries |
+
+- Every request names a profile and must match the **active** profile. Claude switches only with `switch_profile`, and only to a profile whose access isn't `off`. `compare` needs at least `read` on both profiles.
+- Request ids must match `^[A-Za-z0-9-]{8,64}$`. A link alone does nothing: the request file must exist in the active profile's `_claude` folder (a web page can open the link but can't write that file). Requests older than 10 minutes are refused.
+- **Promoted libraries:** a change to one comes back as `needsDemote` instead of running, so Claude asks you first. If you say yes, Claude retries with `allowDemote: true` (needs `risky`): the library is demoted, changed, and **always** re-promoted afterwards — even if the change failed. A failed re-promote is reported loudly. Callers of the library fail for the few seconds it's demoted.
+- **Locked (frozen, not promoted) libraries** are refused, and so is any file **open in VS Code with unsaved edits** that differ from disk (whitespace and the header don't count).
+- Before a push, delete or signature change, the server version is backed up to `<profile folder>/_backup/<timestamp>/`.
+- Passwords and API keys are typed by you into a VS Code input box (`create_profile`, `set_profile_secret`) and go straight to SecretStorage.
+
+### Pushing several functions
+
+Several functions in one library are saved in **one** `Utilities.ApplyChangesWithDiagnostics` call (one compile, all or nothing), so a change that spans functions can't land half-applied. This needs the updated `Utilities` library (batch mode: empty `inFunctionID`). With the old one the extension pushes them one at a time and says so. A single function and widget-flow functions always go through the normal push.
+
+### Setup
+
+1. **Allow a profile:** EFx: Manage Profiles → Edit Profile → last step, *Claude access*.
+2. **Install the server in Claude Desktop:** download `epicor-efx-manager-<version>.mcpb` from the [latest release](https://github.com/mbcpi/epicor-customcode-manager/releases/latest) and double-click it (or drag it into Claude Desktop → Settings → Extensions). Node ships with Claude Desktop — nothing else to install. Cowork sessions linked to that computer get the tools too.
+3. **Or run it from source** (for development): `cd mcp && npm install`, then add it to `claude_desktop_config.json` and restart Claude Desktop:
+   ```json
+   {
+     "mcpServers": {
+       "efx-manager": {
+         "command": "node",
+         "args": ["C:\\path\\to\\epicor-customcode-manager\\mcp\\server.js"]
+       }
+     }
+   }
+   ```
+   Optional env: `EFX_BRIDGE_FILE` (non-default bridge location), `EFX_URI_SCHEME` (fallback scheme if `bridge.json` doesn't have one; the extension writes the right one for VS Code, Insiders or Cursor).
+4. The extension starts with VS Code, so the bridge is up whenever VS Code is open. The first time the MCP server has to launch VS Code, VS Code asks **"Allow 'Epicor EFx Manager' extension to open this URI?"** — allow it.
+
+### Troubleshooting
+
+- *"VS Code didn't pick up the request"* — VS Code isn't running with the extension, the active profile differs, or the URI prompt is waiting.
+- *"Claude access … is off"* — enable it for that profile in the profile editor.
+- *"No result after Ns"* — the op is still running or waiting on a prompt in VS Code; check VS Code before retrying.
+
+---
+
 ## Requirements
 
 - Epicor Kinetic (tested on 2023+)
@@ -197,6 +269,8 @@ Settings are managed through profiles rather than VS Code settings directly. The
 | `efx.activeProfile` | Name of the currently active profile |
 | `efx.activeCompany` | Currently selected company |
 
+Each profile also carries `claudeAccess` (`off` / `read` / `write` / `risky`) — see *Using with Claude*.
+
 ---
 
 ## How Code is Stored Locally
@@ -208,6 +282,17 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 ---
 
 ## Changelog
+
+### 1.0.0
+- **Claude MCP server** (`mcp/`, shipped as a one-click `.mcpb` for Claude Desktop): list, search, pull, compare, push functions and BPM directives, create/delete functions, references, signatures, execute, profiles, promote/demote — all through the extension, gated per profile by *Claude access* (off / read / write / risky). See *Using with Claude*.
+- **Batch push:** several functions in one library save in one compile (needs the 1.0.0 `ApplyChangesWithDiagnostics` code)
+- `Utilities` now ships as the function's source (`EpicorLib/ApplyChangesWithDiagnostics.cs`) instead of a `.efxb` export
+- **Promoted libraries:** Claude asks before demoting; demote → change → re-promote happens in one step and always re-promotes
+- **BPM:** data directives and updatable-BAQ directives now listed, pulled and pushed (tree groups: Method / Data / UBAQ); compare covers UBAQ directives
+- BPM push verifies the saved code and reports errors instead of failing silently
+- Pull/push no longer adds a blank line to the top of the function on every round trip; compare ignores whitespace-only differences
+- New Library escapes the description properly
+- MIT license
 
 ### 0.8.0
 - **Widget-based functions supported** — the widget XAML parser that powered BPM directives now backs Epicor Functions too, so Kind 0 / Kind 1 functions are no longer hidden from the tree
