@@ -4,8 +4,6 @@
 
 A VS Code extension for working with Epicor Kinetic EFx Function Libraries and BPM Directives directly from your editor — pull, edit, push, execute, and manage signatures without leaving VS Code.
 
-![EFx Manager in action](screenshot.png)
-
 ---
 
 ## Features
