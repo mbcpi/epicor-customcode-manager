@@ -1,0 +1,49 @@
+name: Release
+
+# Runs when you push a version tag (git tag v1.0.0 && git push origin v1.0.0).
+# Builds the extension (.vsix) and the Claude Desktop bundle (.mcpb) and attaches
+# them, plus EpicorLib/ApplyChangesWithDiagnostics.cs, to a GitHub release for that tag.
+# Marketplace publishing stays manual.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Tag must match package versions
+        run: |
+          v=$(node -p "require('./package.json').version")
+          m=$(node -p "require('./mcp/package.json').version")
+          [ "$GITHUB_REF_NAME" = "v$v" ] || { echo "Tag $GITHUB_REF_NAME does not match package.json $v"; exit 1; }
+          [ "$m" = "$v" ] || { echo "mcp/package.json $m does not match package.json $v"; exit 1; }
+
+      - run: npm ci
+
+      - run: npm run package
+
+      - run: npm run package:mcp
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            epicor-efx-manager-*.vsix \
+            epicor-efx-manager-*.mcpb \
+            EpicorLib/ApplyChangesWithDiagnostics.cs \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

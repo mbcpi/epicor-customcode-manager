@@ -80,7 +80,7 @@ function bpmApply() {
         return `<div class="list-item ${cls} ${s.svcKey === BPM_SEL ? 'active' : ''}" data-key="${esc(s.svcKey)}" onclick="bpmSelect('${jsAttr(s.svcKey)}')">
           <div class="list-dot"></div>
           <span class="list-name" title="${esc(s.systemCode + '.' + s.businessObject)}">${esc(s.businessObject)}</span>
-          ${s.source === 'DB' ? '<span class="list-delta">DATA</span>' : ''}
+          ${s.source === 'DB' ? '<span class="list-delta">DATA</span>' : s.source === 'DQ' ? '<span class="list-delta">UBAQ</span>' : ''}
           ${delta ? `<span class="list-delta">${delta} diff</span>` : ''}
           <span class="list-badge">${delta ? 'DIFF' : 'MATCH'}</span>
         </div>`;
@@ -107,7 +107,7 @@ function renderBpmDetail(svc, methods) {
     <div class="detail-title">${esc(svc.businessObject)}</div>
     <div class="detail-meta">
       <span>${esc(svc.systemCode)}</span>
-      <span>${svc.source === 'DB' ? 'Data directives' : 'Method directives'}</span>
+      <span>${svc.source === 'DB' ? 'Data directives' : svc.source === 'DQ' ? 'UBAQ directives' : 'Method directives'}</span>
       <span>| ${methods.length} method${methods.length !== 1 ? 's' : ''} · ${n} directive${n !== 1 ? 's' : ''} shown</span>
     </div>
   </div><div class="fn-section">`;

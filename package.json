@@ -2,7 +2,8 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "0.8.2",
+	"version": "1.0.0",
+	"license": "MIT",
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
@@ -14,7 +15,10 @@
 	"categories": [
 		"Other"
 	],
-	"activationEvents": [],
+	"activationEvents": [
+		"onUri",
+		"onStartupFinished"
+	],
 	"main": "./out/extension.js",
 	"contributes": {
 		"viewsContainers": {
@@ -495,6 +499,12 @@
 									"type": "string"
 								},
 								"description": "Allowed company codes for this profile"
+							},
+							"claudeAccess": {
+								"type": "string",
+								"enum": ["off", "read", "write", "risky"],
+								"default": "off",
+								"description": "What Claude may do through the EFx MCP server while this profile is active. Set via EFx: Manage Profiles → Edit Profile; Claude can never change it."
 							}
 						}
 					}
@@ -522,7 +532,8 @@
 		"compile": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --minify",
 		"deploy": "npm run compile && node scripts/deploy.js",
 		"watch": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
-		"package": "npx @vscode/vsce package"
+		"package": "npx @vscode/vsce package",
+		"package:mcp": "cd mcp && npm ci && npm run build"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
