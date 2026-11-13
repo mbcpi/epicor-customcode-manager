@@ -14,3 +14,4 @@ update-extension.sh
 *.vsix
 *.mcpb
 **/*.efxb
+images/hero.png

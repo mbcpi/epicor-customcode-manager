@@ -4,6 +4,11 @@
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
 	"version": "1.0.0",
 	"license": "MIT",
+	"icon": "images/icon.png",
+	"galleryBanner": {
+		"color": "#000000",
+		"theme": "dark"
+	},
 	"publisher": "micah-bragg",
 	"repository": {
 		"type": "git",
