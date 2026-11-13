@@ -4,18 +4,17 @@
 // in BpDirective.Body.
 
 const { openWidgetPanel } = require('./widgetPanel');
+const { bpmSourceOf, directiveTypeLabel } = require('./bpmClient');
 
-function typeLabelOf(directiveType) {
-    return directiveType === 1 ? 'Pre'
-        : directiveType === 3 ? 'Post'
-        : directiveType === 2 ? 'Base'
-        : `Type${directiveType}`;
+function typeLabelOf(directiveType, source = 'BO') {
+    return directiveTypeLabel(source, directiveType);
 }
 
 // `directive` needs DirectiveID, BpMethodCode, Name and DirectiveType. Body is
 // optional — without it (e.g. rehydrating from a pulled file) it's fetched.
 function createBpmHost(bpmClient, directive) {
-    const typeLabel = typeLabelOf(directive.DirectiveType);
+    const source = bpmSourceOf(directive);
+    const typeLabel = typeLabelOf(directive.DirectiveType, source);
     let cached = directive.Body || null;
 
     return {
@@ -25,6 +24,7 @@ function createBpmHost(bpmClient, directive) {
         badge: typeLabel,
         meta: {
             kind: 'bpm',
+            source,
             bpMethodCode: directive.BpMethodCode,
             directiveId: directive.DirectiveID,
             directiveType: directive.DirectiveType,
@@ -33,7 +33,7 @@ function createBpmHost(bpmClient, directive) {
 
         async loadXaml() {
             if (cached) return cached;
-            const ts = await bpmClient.getBpmMethod('BO', directive.BpMethodCode);
+            const ts = await bpmClient.getBpmMethod(source, directive.BpMethodCode);
             const row = (ts?.BpDirective || []).find(d => d.DirectiveID === directive.DirectiveID);
             if (!row) throw new Error(`Directive ${directive.DirectiveID} not found on ${directive.BpMethodCode}`);
             cached = row.Body;
@@ -41,7 +41,7 @@ function createBpmHost(bpmClient, directive) {
         },
 
         async saveXaml(newXaml) {
-            const rawTs = await bpmClient.getBpmMethodRaw('BO', directive.BpMethodCode);
+            const rawTs = await bpmClient.getBpmMethodRaw(source, directive.BpMethodCode);
             const updated = patchBody(rawTs, directive.DirectiveID, newXaml);
             const result = await bpmClient.updateBpmRaw(updated);
             const errs = (result?.returnObj?.BpMessageSvc || []).filter(m => m.Severity > 1);

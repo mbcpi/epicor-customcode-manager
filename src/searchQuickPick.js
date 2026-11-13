@@ -353,4 +353,4 @@ async function openFunctionSearch(client, opts = {}) {
     qp.show();
 }
 
-module.exports = { openFunctionSearch, clearSearchCache };
+module.exports = { openFunctionSearch, clearSearchCache, getCorpus, search };

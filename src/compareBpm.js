@@ -13,9 +13,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { parseDirective, directiveToCanonicalText, looksLikeFlowXaml } = require("./widgetXaml");
-const { formatBpmBodyXaml } = require("./bpmClient");
+const { formatBpmBodyXaml, directiveTypeLabel } = require("./bpmClient");
 
-const TYPE_LABEL = { 1: 'Pre', 2: 'Base', 3: 'Post' };
 
 // ── format detection ───────────────────────────────────────────────────────────
 
@@ -289,7 +288,7 @@ function buildBpmCompare(methodsA, dirsA, methodsB, dirsB) {
                 inA: methA.has(e.Source + '|' + e.BpMethodCode), inB: methB.has(e.Source + '|' + e.BpMethodCode), dirs: [],
             });
         }
-        svc.methods.get(e.BpMethodCode).dirs.push({ ...d, typeLabel: TYPE_LABEL[e.DirectiveType] || ('Type' + e.DirectiveType) });
+        svc.methods.get(e.BpMethodCode).dirs.push({ ...d, typeLabel: directiveTypeLabel(e.Source, e.DirectiveType) });
     }
 
     const counts = { match: 0, diff: 0, 'only-a': 0, 'only-b': 0, renamed: 0 };

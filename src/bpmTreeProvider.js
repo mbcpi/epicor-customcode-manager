@@ -39,6 +39,31 @@ const bpmClient_1 = require("./bpmClient");
 
 // ── Node types ──
 
+const GROUP_LABELS = { BO: 'Method Directives', DB: 'Data Directives', DQ: 'UBAQ Directives' };
+
+class BpmGroupNode extends vscode.TreeItem {
+    constructor(source) {
+        super(GROUP_LABELS[source], vscode.TreeItemCollapsibleState.Collapsed);
+        this.source = source;
+        this.contextValue = 'bpm-group';
+        this.iconPath = new vscode.ThemeIcon(source === 'DB' ? 'database' : source === 'DQ' ? 'table' : 'server-process');
+    }
+}
+
+// A UBAQ query ("Ice.CPI01/CabPDUSNMatching") holding its BPM methods.
+class BpmQueryNode extends vscode.TreeItem {
+    constructor(queryKey, methods) {
+        super(queryKey.replace(/^Ice\./, ''), vscode.TreeItemCollapsibleState.Collapsed);
+        this.queryKey = queryKey;
+        this.methods = methods; // [{ method, directives }]
+        this.contextValue = 'bpm-query';
+        this.iconPath = new vscode.ThemeIcon('table');
+        const count = methods.reduce((n, m) => n + m.directives.length, 0);
+        this.description = `${count} directive${count === 1 ? '' : 's'}`;
+        this.tooltip = queryKey;
+    }
+}
+
 class BpmServiceNode extends vscode.TreeItem {
     constructor(svc) {
         const label = `${svc.SystemCode}.${svc.ServiceKind}.${svc.ServiceName}`;
@@ -51,16 +76,25 @@ class BpmServiceNode extends vscode.TreeItem {
 }
 
 class BpmMethodNode extends vscode.TreeItem {
-    constructor(method, directives) {
-        super(method.Name, vscode.TreeItemCollapsibleState.Collapsed);
+    constructor(method, directives, label) {
+        super(label || method.Name, vscode.TreeItemCollapsibleState.Collapsed);
         this.method = method;
         this.directives = directives;
         this.contextValue = 'bpm-method';
+        const source = bpmClient_1.bpmSourceOf(method);
 
         const flags = [];
-        if (method.HasPreProcessing)  flags.push('Pre');
-        if (method.HasBaseProcessing) flags.push('Base');
-        if (method.HasPostProcessing) flags.push('Post');
+        if (source === 'BO') {
+            if (method.HasPreProcessing)  flags.push('Pre');
+            if (method.HasBaseProcessing) flags.push('Base');
+            if (method.HasPostProcessing) flags.push('Post');
+        } else {
+            // Has*Processing flags describe method directives only — label from
+            // the directives actually present.
+            for (const t of [...new Set((directives || []).map(d => d.DirectiveType))].sort()) {
+                flags.push(bpmClient_1.directiveTypeLabel(source, t));
+            }
+        }
         if (method.Disabled)          flags.push('Disabled');
         if (method.HasOutdatedDirectives) flags.push('⚠ Outdated');
 
@@ -88,10 +122,7 @@ class BpmDirectiveNode extends vscode.TreeItem {
         super(directive.Name, vscode.TreeItemCollapsibleState.None);
         this.directive = directive;
 
-        const typeLabel = directive.DirectiveType === 1 ? 'Pre'
-            : directive.DirectiveType === 3 ? 'Post'
-            : directive.DirectiveType === 2 ? 'Base'
-            : `Type${directive.DirectiveType}`;
+        const typeLabel = bpmClient_1.directiveTypeLabel(bpmClient_1.bpmSourceOf(directive), directive.DirectiveType);
 
         const { hasCustomCode } = bpmClient_1.extractBpmCode(directive.Body);
 
@@ -144,6 +175,8 @@ class BpmDirectiveNode extends vscode.TreeItem {
     }
 }
 
+exports.BpmGroupNode    = BpmGroupNode;
+exports.BpmQueryNode    = BpmQueryNode;
 exports.BpmServiceNode  = BpmServiceNode;
 exports.BpmMethodNode   = BpmMethodNode;
 exports.BpmDirectiveNode = BpmDirectiveNode;
@@ -158,6 +191,8 @@ class BpmTreeProvider {
         this.services = [];
         // Cache: serviceKey -> { methods, directives }
         this.methodCache = new Map();
+        // Cache: source ('DB' | 'DQ') -> { methods, directives }
+        this.sourceCache = new Map();
     }
 
     setClient(bpmClient) {
@@ -172,6 +207,7 @@ class BpmTreeProvider {
         try {
             this.services = await this.bpmClient.getBpmServices();
             this.methodCache.clear();
+            this.sourceCache.clear();
             this._onDidChangeTreeData.fire(undefined);
             vscode.window.showInformationMessage(`BPM: Loaded ${this.services.length} services`);
         } catch (err) {
@@ -184,6 +220,40 @@ class BpmTreeProvider {
         this.methodCache.delete(key);
     }
 
+    invalidateSource(source) {
+        this.sourceCache.delete(source);
+    }
+
+    // All methods + directives for DB or DQ, loaded once per refresh. Directive
+    // rows get Source stamped so pull/push know which BpMethodSvc source to use.
+    async _loadSource(source) {
+        let data = this.sourceCache.get(source);
+        if (data) return data;
+        const raw = await this.bpmClient.getBpmRowsBySource(source);
+        data = {
+            methods: raw.methods.map(m => ({ ...m, Source: source })),
+            directives: raw.directives.map(d => ({ ...d, Source: source })),
+        };
+        this.sourceCache.set(source, data);
+        return data;
+    }
+
+    // Methods that actually carry directives, each with its directive rows.
+    _methodsWithDirectives(data) {
+        const byCode = new Map();
+        for (const d of data.directives) {
+            if (!byCode.has(d.BpMethodCode)) byCode.set(d.BpMethodCode, []);
+            byCode.get(d.BpMethodCode).push(d);
+        }
+        const out = [];
+        for (const [code, directives] of byCode) {
+            const method = data.methods.find(m => m.BpMethodCode === code)
+                || { BpMethodCode: code, Name: code.split('.').pop(), Source: directives[0].Source };
+            out.push({ method, directives });
+        }
+        return out.sort((a, b) => a.method.BpMethodCode.localeCompare(b.method.BpMethodCode));
+    }
+
     getTreeItem(element) {
         return element;
     }
@@ -191,8 +261,46 @@ class BpmTreeProvider {
     async getChildren(element) {
         if (!this.bpmClient) return [];
 
-        // Root: services
+        // Root: one group per BPM source
         if (!element) {
+            return bpmClient_1.BPM_SOURCES.map(src => new BpmGroupNode(src));
+        }
+
+        // Data / UBAQ groups load in one call per source
+        if (element instanceof BpmGroupNode && element.source !== 'BO') {
+            let data;
+            try {
+                data = await this._loadSource(element.source);
+            } catch (err) {
+                vscode.window.showErrorMessage(`BPM: Failed to load ${GROUP_LABELS[element.source]}: ${err.message}`);
+                return [];
+            }
+            const methods = this._methodsWithDirectives(data);
+            if (element.source === 'DB') {
+                // Erp.Part.Update -> "Erp.Part"
+                return methods.map(({ method, directives }) =>
+                    new BpmMethodNode(method, directives, method.BpMethodCode.replace(/\.Update$/, '')));
+            }
+            // DQ: Ice.CPI01/Query.GetList -> query "Ice.CPI01/Query", method "GetList"
+            const byQuery = new Map();
+            for (const m of methods) {
+                const code = m.method.BpMethodCode;
+                const queryKey = code.slice(0, code.lastIndexOf('.'));
+                if (!byQuery.has(queryKey)) byQuery.set(queryKey, []);
+                byQuery.get(queryKey).push(m);
+            }
+            return [...byQuery.entries()]
+                .sort((a, b) => a[0].localeCompare(b[0]))
+                .map(([queryKey, ms]) => new BpmQueryNode(queryKey, ms));
+        }
+
+        if (element instanceof BpmQueryNode) {
+            return element.methods.map(({ method, directives }) =>
+                new BpmMethodNode(method, directives, method.BpMethodCode.split('.').pop()));
+        }
+
+        // Method directives group: services
+        if (element instanceof BpmGroupNode) {
             return this.services
                 .sort((a, b) => {
                     const ka = `${a.SystemCode}.${a.ServiceKind}.${a.ServiceName}`;

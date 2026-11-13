@@ -1,0 +1,21 @@
+{
+	"name": "epicor-efx-manager-mcp",
+	"version": "1.0.0",
+	"description": "MCP server that lets Claude drive the Epicor EFx Manager VS Code extension. The extension makes every Epicor call; this server never reads secrets.",
+	"private": true,
+	"main": "server.js",
+	"bin": {
+		"efx-mcp": "server.js"
+	},
+	"engines": {
+		"node": ">=18"
+	},
+	"scripts": {
+		"start": "node server.js",
+		"build": "node build.js"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.32.2"
+	},
+	"license": "MIT"
+}

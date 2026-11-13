@@ -51,6 +51,8 @@ const updater_1 = require("./updater");
 const kineticLayerClient_1 = require("./kineticLayerClient");
 const { ComparePanel } = require("./comparePanel");
 const { openFunctionSearch, clearSearchCache } = require("./searchQuickPick");
+const { ClaudeBridge } = require("./claudeBridge");
+const claudeOps_1 = require("./claudeOps");
 // Store pulled tablesets for push-back/debugging.
 const pulledTablesets = new Map();
 // Map open .cs files back to their library/function.
@@ -257,6 +259,164 @@ function markEfxRefTableUpdatable(rawTableset, tableId, updatable) {
     return updated;
 }
 
+// ── Headless library operations ──────────────────────────────────────────────
+// The tree commands collect input with prompts, then call these. The Claude
+// bridge calls them directly. They throw on failure and never show UI.
+
+function diagnosticsHaveErrors(diags) {
+    return (diags || []).some(d => typeof d === 'object'
+        ? (d.Severity ?? 2) >= 2
+        : /\berror\b/i.test(String(d)));
+}
+function diagnosticsText(diags) {
+    return (diags || []).map(d => typeof d === 'object' ? (d.ErrorText || d.Message || JSON.stringify(d)) : String(d));
+}
+
+// sigs: [{ ArgumentName, DataType, Response, Order }]
+// Returns { diagnostics: string[], signaturesSaved, signatureError }.
+async function coreCreateFunction(libraryId, functionId, description, sigs = []) {
+    let rawTableset = await client.getLibraryRaw(libraryId);
+    const emptyBody = JSON.stringify({ Code: "// New function\r\n", Usings: "" });
+    const newFuncJson = JSON.stringify({
+        LibraryID: libraryId,
+        FunctionID: functionId,
+        Description: description || null,
+        Kind: 2,
+        RequireTransaction: false,
+        SingleRowMode: false,
+        Private: false,
+        Disabled: false,
+        Invalid: false,
+        Thumbnail: null,
+        Body: emptyBody,
+        Notes: null,
+        SysRevID: 0,
+        SysRowID: "00000000-0000-0000-0000-000000000000",
+        BitFlag: 0,
+        RowMod: "A"
+    });
+    rawTableset = injectRowIntoArray(rawTableset, 'EfxFunction', newFuncJson);
+    const result = await client.applyChangesRaw(rawTableset);
+    const diagnostics = diagnosticsText(result.diagnostics);
+
+    let signaturesSaved = sigs.length === 0;
+    let signatureError = null;
+    if (sigs.length > 0) {
+        // Retry — Epicor may not have committed the new function row by the
+        // time we immediately call getLibraryRaw.
+        for (let attempt = 0; attempt < 4 && !signaturesSaved; attempt++) {
+            if (attempt > 0) await new Promise(r => setTimeout(r, 800 * attempt));
+            try {
+                await client.saveSignatures(libraryId, functionId, sigs);
+                signaturesSaved = true;
+            } catch (e) {
+                signatureError = e.message;
+            }
+        }
+    }
+    treeProvider.invalidateCache(libraryId);
+    await treeProvider.refresh();
+    return { diagnostics, signaturesSaved, signatureError };
+}
+
+async function coreDeleteFunction(libraryId, functionId) {
+    // Verify library isn't frozen — same guard as push.
+    const tableset = await client.getLibrary(libraryId);
+    const libraryRow = tableset && tableset.EfxLibrary && tableset.EfxLibrary[0];
+    if (!libraryRow) {
+        throw new Error(`Library ${libraryId} not found on server`);
+    }
+    if (libraryRow.Frozen === true) {
+        throw new Error(libraryRow.Published
+            ? `${libraryId} is promoted to production — demote it first (right-click the library → Demote from Production).`
+            : `${libraryId} is locked/frozen in Epicor. Unfreeze it before deleting functions.`);
+    }
+    // Pull fresh raw tableset, mark function as deleted, send.
+    const rawTableset = await client.getLibraryRaw(libraryId);
+    const updatedRaw = markEfxFunctionDeleted(rawTableset, libraryId, functionId);
+    const result = await client.applyChangesRaw(updatedRaw);
+    if (diagnosticsHaveErrors(result.diagnostics)) {
+        throw new Error(`Server rejected delete:\n${diagnosticsText(result.diagnostics).join('\n')}`);
+    }
+    pulledTablesets.delete(libraryId);
+    // Drop fileMap entries so re-creating with the same name later works cleanly.
+    for (const [k, v] of fileMap.entries()) {
+        if (v && v.libraryId === libraryId && v.functionId === functionId) fileMap.delete(k);
+    }
+    treeProvider.invalidateCache(libraryId);
+    await treeProvider.refresh();
+}
+
+// Returns diagnostics (string[]).
+async function coreCreateLibrary(libraryId, description) {
+    // Spliced into raw JSON — no whitespace, quotes or backslashes.
+    if (!/^[^\s"\\]+$/.test(String(libraryId || ''))) {
+        throw new Error('Library ID cannot be empty or contain spaces, quotes or backslashes');
+    }
+    let rawDefaults = await client.getDefaultsRaw();
+    rawDefaults = rawDefaults.replace(/"LibraryID":"@library"/g, `"LibraryID":"${libraryId}"`);
+    rawDefaults = rawDefaults.replace(/"OriginalID":"@library"/, `"OriginalID":"${libraryId}"`);
+    rawDefaults = rawDefaults.replace(/"FunctionID":"@function"/, `"FunctionID":"__placeholder__"`);
+    if (description) {
+        // JSON-escape: a quote or backslash in the description must not break the tableset.
+        rawDefaults = rawDefaults.replace(/"Description":null/, () => `"Description":${JSON.stringify(String(description))}`);
+    }
+    // Library RowMod → A
+    rawDefaults = rawDefaults.replace(/("OriginalID":"[^"]*"[^}]*"RowMod":")(")/, '$1A$2');
+    rawDefaults = rawDefaults.replace('"AllowCustomCodeFunctions":false', '"AllowCustomCodeFunctions":true');
+    rawDefaults = rawDefaults.replace('"DirectDBAccess":0', '"DirectDBAccess":2');
+    // Drop the placeholder function — create an empty library.
+    const efxFuncStart = rawDefaults.indexOf('"EfxFunction":[');
+    if (efxFuncStart !== -1) {
+        const bracketStart = rawDefaults.indexOf('[', efxFuncStart);
+        const bracketEnd = findMatchingRaw(rawDefaults, bracketStart, '[', ']');
+        if (bracketEnd > bracketStart) {
+            rawDefaults = rawDefaults.substring(0, bracketStart) + '[]' + rawDefaults.substring(bracketEnd + 1);
+        }
+    }
+    const result = await client.applyChangesRaw(rawDefaults);
+    await treeProvider.refresh();
+    return diagnosticsText(result.diagnostics);
+}
+
+// kind: 'table' | 'service' | 'assembly' | 'library'. Returns diagnostics (string[]).
+async function coreAddReference(libraryId, kind, value, opts = {}) {
+    const base = { LibraryID: libraryId };
+    let arrayName, row;
+    if (kind === 'table') {
+        if (!String(value).includes('.')) throw new Error('Table ID format must be NAMESPACE.TableName (e.g. ERP.Part)');
+        arrayName = 'EfxRefTable'; row = { ...base, TableID: value, Updatable: !!opts.updatable };
+    } else if (kind === 'service') {
+        if (String(value).split(':').length < 3) throw new Error('Service ID format must be NAMESPACE:TYPE:Name (e.g. ERP:BO:Part)');
+        arrayName = 'EfxRefService'; row = { ...base, ServiceID: value };
+    } else if (kind === 'assembly') {
+        if (!String(value).toLowerCase().endsWith('.dll')) throw new Error('Assembly must end in .dll');
+        arrayName = 'EfxRefAssembly'; row = { ...base, Assembly: value };
+    } else if (kind === 'library') {
+        arrayName = 'EfxRefLibrary'; row = { ...base, LibraryRef: value, Mode: Number.isInteger(opts.mode) ? opts.mode : 0 };
+    } else {
+        throw new Error(`Unknown reference kind "${kind}"`);
+    }
+    let raw = await client.getLibraryRaw(libraryId);
+    const newRow = JSON.stringify({ ...row, SysRevID: 0, SysRowID: '00000000-0000-0000-0000-000000000000', RowMod: 'A' });
+    raw = injectRowIntoArray(raw, arrayName, newRow);
+    const result = await client.applyChangesRaw(raw);
+    treeProvider.invalidateCache(libraryId);
+    treeProvider._onDidChangeTreeData.fire(undefined);
+    return diagnosticsText(result.diagnostics);
+}
+
+async function coreSetTableUpdatable(libraryId, tableId, updatable) {
+    const rawTableset = await client.getLibraryRaw(libraryId);
+    const updatedRaw  = markEfxRefTableUpdatable(rawTableset, tableId, updatable);
+    const result      = await client.applyChangesRaw(updatedRaw);
+    if (diagnosticsHaveErrors(result.diagnostics)) {
+        throw new Error(`Server rejected update:\n${diagnosticsText(result.diagnostics).join('\n')}`);
+    }
+    treeProvider.invalidateCache(libraryId);
+    treeProvider._onDidChangeTreeData.fire(undefined);
+}
+
 async function saveOpenDocumentIfDirty(filePath) {
     const normalized = normalizeFsPath(filePath);
     const doc = vscode.workspace.textDocuments.find(d => d.uri && normalizeFsPath(d.uri.fsPath) === normalized);
@@ -331,7 +491,7 @@ function stripGeneratedHeaderInfo(fileContent) {
             .trimStart();
     }
 
-    const remainingLines = lines.slice(markerIndex + 1);
+    let remainingLines = lines.slice(markerIndex + 1);
 
     if (gluedRemainder) {
         // The glued text becomes a new first line replacing the marker line,
@@ -339,10 +499,17 @@ function stripGeneratedHeaderInfo(fileContent) {
         return { content: [gluedRemainder, ...remainingLines].join("\n"), lineOffset: markerIndex };
     }
 
-    return { content: remainingLines.join("\n"), lineOffset: markerIndex + 1 };
+    // Pull writes a blank separator line after the marker. Leaving it on the
+    // code made every pull/push round trip add one leading blank line on the
+    // server — drop all leading blank lines (and count them for diagnostics).
+    let blank = 0;
+    while (blank < remainingLines.length && remainingLines[blank].trim() === "") blank++;
+    remainingLines = remainingLines.slice(blank);
+
+    return { content: remainingLines.join("\n"), lineOffset: markerIndex + 1 + blank };
 }
 function normalizeCodeForCompare(code) {
-    return String(code || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    return efxBody_1.normalizeCode(code);
 }
 function formatBOUpdErrors(errors) {
     if (!errors || errors.length === 0) {
@@ -371,8 +538,10 @@ function activate(context) {
     context.subscriptions.push(vscode.window.registerWebviewViewProvider("efxExecuteView", executeViewProvider, {
         webviewOptions: { retainContextWhenHidden: true },
     }));
-    // Try to initialize client from settings + secrets.
-    initClient(context).then(() => updateViewDescriptions());
+    // Try to initialize client from settings + secrets. The Claude bridge waits
+    // on this so a request that cold-starts VS Code doesn't run unconnected.
+    const clientReady = initClient(context).catch(err => console.error("EFx: initClient failed", err));
+    clientReady.then(() => updateViewDescriptions());
     // ── Auto-update: check GitHub releases on startup + manual command ──
     updater_1.registerUpdateCommand(context);
     updater_1.checkForUpdatesOnStartup(context);
@@ -521,8 +690,9 @@ function activate(context) {
 
     // Write pulled files under efxDir/<lib>/. Never clobbers local work: open
     // files with unsaved edits are skipped; saved files whose code differs from
-    // Epicor are asked about once. Returns { written, skipped } or null if cancelled.
-    async function writePulledFiles(efxDir, files, skipped) {
+    // Epicor are asked about once (policy 'ask'), kept ('keep') or overwritten
+    // ('overwrite' — headless callers). Returns { written, skipped } or null if cancelled.
+    async function writePulledFiles(efxDir, files, skipped, policy = "ask") {
         const codeOnly = text => {
             const t = String(text).replace(/\r\n/g, "\n");
             const i = t.indexOf(PULL_SEP);
@@ -541,9 +711,11 @@ function activate(context) {
         if (differs.length) {
             const names = differs.map(f => `${f.libraryId}.${f.functionId}`);
             const list = names.slice(0, 15).join(", ") + (names.length > 15 ? `, +${names.length - 15} more` : "");
-            const pick = await vscode.window.showWarningMessage(
-                `${differs.length} local file(s) differ from Epicor (unpushed edits?): ${list}`,
-                { modal: true }, "Overwrite", "Keep Local Copies");
+            const pick = policy === "overwrite" ? "Overwrite"
+                : policy === "keep" ? "Keep Local Copies"
+                : await vscode.window.showWarningMessage(
+                    `${differs.length} local file(s) differ from Epicor (unpushed edits?): ${list}`,
+                    { modal: true }, "Overwrite", "Keep Local Copies");
             if (!pick) return null;
             if (pick === "Keep Local Copies") {
                 files = files.filter(f => !differs.includes(f));
@@ -567,6 +739,41 @@ function activate(context) {
         const act = await (skipped.length ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg, "Reveal in Finder", "Copy Path");
         if (act === "Reveal in Finder") await vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(revealDir));
         else if (act === "Copy Path") await vscode.env.clipboard.writeText(revealDir);
+    }
+
+    // Every library's files (bulk GetLibraries in chunks of 20, one-by-one fallback).
+    // Pure fetch + build, no disk writes. Returns { files, skipped, libCount, cancelled }.
+    async function collectAllLibraryFiles(onProgress = () => {}, isCancelled = () => false) {
+        const files = [], skipped = [];
+        const libs = treeProvider.libraries && treeProvider.libraries.length ? treeProvider.libraries : await client.getLibraryList();
+        const ids = [...new Set(libs.map(l => l.LibraryID))].sort();
+        const stamp = new Date().toISOString();
+        const CHUNK = 20;
+        for (let i = 0; i < ids.length; i += CHUNK) {
+            if (isCancelled()) return { files, skipped, libCount: ids.length, cancelled: true };
+            const chunk = ids.slice(i, i + CHUNK);
+            onProgress(`${Math.min(i + CHUNK, ids.length)} / ${ids.length} libraries`, (chunk.length / ids.length) * 100);
+            let byLib = null;
+            try {
+                const raw = await client.request(client.getDesignerUrl("GetLibraries"), { libraryIds: chunk });
+                const ts = raw && typeof raw === "object" ? (raw.returnObj || raw) : null;
+                if (ts && Array.isArray(ts.EfxFunction)) {
+                    byLib = new Map(chunk.map(id => [id, { EfxFunction: [] }]));
+                    for (const fn of ts.EfxFunction) if (byLib.has(fn.LibraryID)) byLib.get(fn.LibraryID).EfxFunction.push(fn);
+                }
+            }
+            catch { /* fall back to one call per library below */ }
+            for (const id of chunk) {
+                let ts = byLib ? byLib.get(id) : null;
+                if (!ts) {
+                    try { ts = await client.getLibrary(id); }
+                    catch (e) { skipped.push(`${id} (could not load: ${e.message})`); continue; }
+                }
+                const built = buildLibraryFiles(id, ts, stamp);
+                files.push(...built.files); skipped.push(...built.skipped);
+            }
+        }
+        return { files, skipped, libCount: ids.length, cancelled: false };
     }
 
     // Right-click a library: just that library.
@@ -609,40 +816,15 @@ function activate(context) {
             vscode.window.showWarningMessage("EFx: Storage location not set — pull cancelled.");
             return;
         }
-        const files = [], skipped = [];
+        let files = [], skipped = [];
         let libCount = 0;
         try {
             const done = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Pulling all libraries", cancellable: true }, async (progress, token) => {
-                let libs = treeProvider.libraries && treeProvider.libraries.length ? treeProvider.libraries : await client.getLibraryList();
-                const ids = [...new Set(libs.map(l => l.LibraryID))].sort();
-                libCount = ids.length;
-                const stamp = new Date().toISOString();
-                const CHUNK = 20;
-                for (let i = 0; i < ids.length; i += CHUNK) {
-                    if (token.isCancellationRequested) return false;
-                    const chunk = ids.slice(i, i + CHUNK);
-                    progress.report({ message: `${Math.min(i + CHUNK, ids.length)} / ${ids.length} libraries`, increment: (chunk.length / ids.length) * 100 });
-                    let byLib = null;
-                    try {
-                        const raw = await client.request(client.getDesignerUrl("GetLibraries"), { libraryIds: chunk });
-                        const ts = raw && typeof raw === "object" ? (raw.returnObj || raw) : null;
-                        if (ts && Array.isArray(ts.EfxFunction)) {
-                            byLib = new Map(chunk.map(id => [id, { EfxFunction: [] }]));
-                            for (const fn of ts.EfxFunction) if (byLib.has(fn.LibraryID)) byLib.get(fn.LibraryID).EfxFunction.push(fn);
-                        }
-                    }
-                    catch { /* fall back to one call per library below */ }
-                    for (const id of chunk) {
-                        let ts = byLib ? byLib.get(id) : null;
-                        if (!ts) {
-                            try { ts = await client.getLibrary(id); }
-                            catch (e) { skipped.push(`${id} (could not load: ${e.message})`); continue; }
-                        }
-                        const built = buildLibraryFiles(id, ts, stamp);
-                        files.push(...built.files); skipped.push(...built.skipped);
-                    }
-                }
-                return true;
+                const all = await collectAllLibraryFiles(
+                    (message, increment) => progress.report({ message, increment }),
+                    () => token.isCancellationRequested);
+                ({ files, skipped, libCount } = all);
+                return !all.cancelled;
             });
             if (!done) { vscode.window.showInformationMessage("EFx: Pull all cancelled — nothing written."); return; }
         }
@@ -654,20 +836,27 @@ function activate(context) {
         if (result) await reportPull(`all ${libCount} libraries`, result, efxDir);
     }));
     // -- Push Function --
+    // Returns { ok, libraryId, functionId, message, errors, diagnostics } on every
+    // path so callers (Claude bridge) get the outcome; button/tree/auto-push ignore it.
     context.subscriptions.push(vscode.commands.registerCommand("efx.pushFunction", async (node, skipConfirm = false) => {
-        if (!client) {
-            return;
-        }
-        let libraryId;
-        let functionId;
+        let libraryId = node?.libraryId;
+        let functionId = node?.func?.FunctionID;
         let filePath;
+        let lastErrors = [];
+        let lastDiagnostics = [];
+        const outcome = (ok, message) => ({
+            ok, libraryId, functionId, message,
+            errors: ok ? [] : (lastErrors.length ? lastErrors : [message]),
+            diagnostics: lastDiagnostics,
+        });
+        if (!client) {
+            return outcome(false, "EFx: Not connected");
+        }
         if (node) {
-            libraryId = node.libraryId;
-            functionId = node.func.FunctionID;
             const efxDir = await getEfxDir();
             if (!efxDir) {
                 vscode.window.showWarningMessage("EFx: Storage location not set — push cancelled.");
-                return;
+                return outcome(false, "EFx: Storage location not set — push cancelled.");
             }
             filePath = path.join(efxDir, libraryId, `${functionId}.cs`);
         }
@@ -676,32 +865,34 @@ function activate(context) {
             const editor = vscode.window.activeTextEditor;
             if (!editor) {
                 vscode.window.showWarningMessage("EFx: No active file to push");
-                return;
+                return outcome(false, "EFx: No active file to push");
             }
             filePath = editor.document.uri.fsPath;
             const mapping = await resolveMapping(filePath);
             if (!mapping) {
                 vscode.window.showWarningMessage("EFx: This file is not a pulled EFx function");
-                return;
+                return outcome(false, "EFx: This file is not a pulled EFx function");
             }
             if (mapping.isWidgetCode) {
-                await pushWidgetCodeFile(filePath, mapping);
-                return;
+                libraryId = mapping.libraryId;
+                functionId = mapping.functionId;
+                const w = await pushWidgetCodeFile(filePath, mapping);
+                return outcome(!!w?.ok, w?.message || "Widget push finished");
             }
             libraryId = mapping.libraryId;
             functionId = mapping.functionId;
         }
         if (!filePath || !fs.existsSync(filePath)) {
             vscode.window.showErrorMessage("EFx: File not found. Pull the function first.");
-            return;
+            return outcome(false, "EFx: File not found. Pull the function first.");
         }
         if (!skipConfirm) {
             const confirm = await vscode.window.showWarningMessage(`Push ${functionId} to ${libraryId}?`, { modal: true }, "Push");
             if (confirm !== "Push") {
-                return;
+                return outcome(false, "Push cancelled");
             }
         }
-        await vscode.window.withProgress(
+        return await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: `Pushing ${functionId}...` },
             async () => {
                 try {
@@ -770,7 +961,7 @@ function activate(context) {
                         vscode.window.showInformationMessage(`EFx: Verified save of ${libraryId}.${functionId} (widget ${nodeId})`);
                         treeProvider.invalidateCache(libraryId);
                         clearSearchCache();
-                        return;
+                        return outcome(true, `Verified save of ${libraryId}.${functionId} (widget ${nodeId})`);
                     }
 
                     // Preserve existing Usings while replacing only Code.
@@ -789,6 +980,10 @@ function activate(context) {
 
                     if (!result.saved) {
                         const diagnostics = result.diagnostics || result.errors || [];
+                        lastErrors = (result.errors || []).map(String);
+                        lastDiagnostics = diagnostics.map(d => (typeof d === 'object' && d !== null)
+                            ? { line: d.Line != null ? d.Line + headerOffset : null, column: d.Column ?? null, severity: d.Severity ?? 2, message: [d.Code, d.Message].filter(Boolean).join(': ') || String(d) }
+                            : { line: null, column: null, severity: 2, message: String(d) });
                         if (diagnostics.length > 0) {
                             const vsDiags = diagnostics.map(d => {
                                 if (typeof d === 'object' && d !== null) {
@@ -843,10 +1038,12 @@ function activate(context) {
                     treeProvider.invalidateCache(libraryId);
                     // The pushed body is now stale in the find index.
                     clearSearchCache();
+                    return outcome(true, `Verified save of ${libraryId}.${functionId}`);
                 }
                 catch (err) {
                     console.error("EFx Push failed:", err);
                     vscode.window.showErrorMessage(`EFx Push failed: ${err.message}`);
+                    return outcome(false, err.message);
                 }
             });
     }));
@@ -1055,112 +1252,19 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Creating ${functionId}...` },
             async () => {
                 try {
-                    // Get fresh raw tableset for the library
-                    let rawTableset = await client.getLibraryRaw(libraryId);
-
-                    // Build the new function row JSON
-                    const emptyBody = JSON.stringify({ Code: "// New function\r\n", Usings: "" });
-                    const newFuncRow = {
-                        LibraryID: libraryId,
-                        FunctionID: functionId,
-                        Description: description || null,
-                        Kind: 2,
-                        RequireTransaction: false,
-                        SingleRowMode: false,
-                        Private: false,
-                        Disabled: false,
-                        Invalid: false,
-                        Thumbnail: null,
-                        Body: emptyBody,
-                        Notes: null,
-                        SysRevID: 0,
-                        SysRowID: "00000000-0000-0000-0000-000000000000",
-                        BitFlag: 0,
-                        RowMod: "A"
-                    };
-                    const newFuncJson = JSON.stringify(newFuncRow);
-
-                    // Insert the new function row into the EfxFunction array in the raw JSON
-                    // Find the end of the EfxFunction array and insert before the closing ]
-                    const efxFuncArrayStart = rawTableset.indexOf('"EfxFunction":[');
-                    if (efxFuncArrayStart === -1) {
-                        vscode.window.showErrorMessage('EFx: Could not find EfxFunction array in tableset');
-                        return;
-                    }
-
-                    // Find the closing ] of the EfxFunction array
-                    // We need to track bracket depth starting from the [
-                    const arrayStart = rawTableset.indexOf('[', efxFuncArrayStart);
-                    let depth = 0;
-                    let arrayEnd = -1;
-                    for (let i = arrayStart; i < rawTableset.length; i++) {
-                        const ch = rawTableset[i];
-                        if (ch === '"') {
-                            // Skip strings
-                            i++;
-                            while (i < rawTableset.length) {
-                                if (rawTableset[i] === '\\') { i++; }
-                                else if (rawTableset[i] === '"') { break; }
-                                i++;
-                            }
-                            continue;
-                        }
-                        if (ch === '[') depth++;
-                        if (ch === ']') {
-                            depth--;
-                            if (depth === 0) { arrayEnd = i; break; }
-                        }
-                    }
-
-                    if (arrayEnd === -1) {
-                        vscode.window.showErrorMessage('EFx: Could not parse EfxFunction array');
-                        return;
-                    }
-
-                    // Check if the array has existing items
-                    const arrayContent = rawTableset.substring(arrayStart + 1, arrayEnd).trim();
-                    const separator = arrayContent.length > 0 ? ',' : '';
-
-                    // Insert the new row
-                    rawTableset = rawTableset.substring(0, arrayEnd) + separator + newFuncJson + rawTableset.substring(arrayEnd);
-
-                    // Apply
-                    const result = await client.applyChangesRaw(rawTableset);
-
-                    if (result.diagnostics && result.diagnostics.length > 0) {
-                        const diagMsg = result.diagnostics.join('\n');
-                        vscode.window.showWarningMessage(`EFx: ${functionId} created with diagnostics:\n${diagMsg}`);
+                    const created = await coreCreateFunction(libraryId, functionId, description, allSigs);
+                    if (created.diagnostics.length > 0) {
+                        vscode.window.showWarningMessage(`EFx: ${functionId} created with diagnostics:\n${created.diagnostics.join('\n')}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Created ${libraryId}.${functionId} ✓`);
                     }
-
-                    // ── Save signatures if user supplied any ──
                     if (allSigs.length > 0) {
-                        // Retry a few times — Epicor may not have committed the new
-                        // function row by the time we immediately call getLibraryRaw
-                        let sigSaved = false;
-                        let sigErr = null;
-                        for (let attempt = 0; attempt < 4; attempt++) {
-                            if (attempt > 0) {
-                                await new Promise(r => setTimeout(r, 800 * attempt));
-                            }
-                            try {
-                                await client.saveSignatures(libraryId, functionId, allSigs);
-                                sigSaved = true;
-                                break;
-                            } catch (e) {
-                                sigErr = e;
-                            }
-                        }
-                        if (sigSaved) {
+                        if (created.signaturesSaved) {
                             vscode.window.showInformationMessage(`EFx: Saved ${allSigs.length} parameter(s) for ${functionId} ✓`);
                         } else {
-                            vscode.window.showWarningMessage(`EFx: Function created but signatures failed: ${sigErr?.message}. Add them via ⚙ Edit Signatures in the Execute panel.`);
+                            vscode.window.showWarningMessage(`EFx: Function created but signatures failed: ${created.signatureError}. Add them via ⚙ Edit Signatures in the Execute panel.`);
                         }
                     }
-
-                    treeProvider.invalidateCache(libraryId);
-                    await treeProvider.refresh();
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Create function failed: ${err.message}`);
                 }
@@ -1196,48 +1300,7 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Deleting ${functionId}...` },
             async () => {
                 try {
-                    // Verify library isn't frozen — same guard as push.
-                    const tableset = await client.getLibrary(libraryId);
-                    const libraryRow = tableset && tableset.EfxLibrary && tableset.EfxLibrary[0];
-                    if (!libraryRow) {
-                        throw new Error(`Library ${libraryId} not found on server`);
-                    }
-                    if (libraryRow.Frozen === true) {
-                        const reason = libraryRow.Published
-                            ? `${libraryId} is promoted to production — demote it first (right-click the library → Demote from Production).`
-                            : `${libraryId} is locked/frozen in Epicor. Unfreeze it before deleting functions.`;
-                        throw new Error(reason);
-                    }
-
-                    // Pull fresh raw tableset, mark function as deleted, send.
-                    const rawTableset = await client.getLibraryRaw(libraryId);
-                    const updatedRaw = markEfxFunctionDeleted(rawTableset, libraryId, functionId);
-                    const result = await client.applyChangesRaw(updatedRaw);
-
-                    // Surface diagnostics if any.
-                    const diags = result.diagnostics || [];
-                    const hasErrors = diags.some(d =>
-                        typeof d === 'object'
-                            ? (d.Severity ?? 2) >= 2
-                            : /\berror\b/i.test(String(d))
-                    );
-                    if (hasErrors) {
-                        const msg = diags.map(d => typeof d === 'object' ? (d.ErrorText || JSON.stringify(d)) : String(d)).join('\n');
-                        throw new Error(`Server rejected delete:\n${msg}`);
-                    }
-
-                    // Clear any cached pulled tableset for this library.
-                    pulledTablesets.delete(libraryId);
-
-                    // Drop fileMap entries for this function so re-creating with the same name later works cleanly.
-                    for (const [k, v] of fileMap.entries()) {
-                        if (v && v.libraryId === libraryId && v.functionId === functionId) {
-                            fileMap.delete(k);
-                        }
-                    }
-
-                    treeProvider.invalidateCache(libraryId);
-                    await treeProvider.refresh();
+                    await coreDeleteFunction(libraryId, functionId);
                     vscode.window.showInformationMessage(`EFx: Deleted ${libraryId}.${functionId} ✓ (local .cs file, if any, was left in place)`);
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Delete function failed: ${err.message}`);
@@ -1272,69 +1335,12 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Creating library ${libraryId}...` },
             async () => {
                 try {
-                    // Get the defaults template as raw JSON
-                    let rawDefaults = await client.getDefaultsRaw();
-
-                    // Replace placeholder values
-                    rawDefaults = rawDefaults.replace(/"LibraryID":"@library"/g, `"LibraryID":"${libraryId}"`);
-                    rawDefaults = rawDefaults.replace(/"OriginalID":"@library"/, `"OriginalID":"${libraryId}"`);
-                    rawDefaults = rawDefaults.replace(/"FunctionID":"@function"/, `"FunctionID":"__placeholder__"`);
-
-                    // Set description on the library
-                    if (description) {
-                        rawDefaults = rawDefaults.replace(/"Description":null/, `"Description":"${description}"`);
-                    }
-
-                    // Set RowMod to A for add on both library and function rows
-                    // Library RowMod
-                    rawDefaults = rawDefaults.replace(
-                        /("OriginalID":"[^"]*"[^}]*"RowMod":")(")/, '$1A$2'
-                    );
-
-                    // Set AllowCustomCodeFunctions to true and Kind to 2 (code-based)
-                    rawDefaults = rawDefaults.replace('"AllowCustomCodeFunctions":false', '"AllowCustomCodeFunctions":true');
-                    rawDefaults = rawDefaults.replace('"DirectDBAccess":0', '"DirectDBAccess":2');
-
-                    // Remove the placeholder function — we'll create an empty library
-                    // Replace EfxFunction array with empty
-                    const efxFuncStart = rawDefaults.indexOf('"EfxFunction":[');
-                    if (efxFuncStart !== -1) {
-                        const bracketStart = rawDefaults.indexOf('[', efxFuncStart);
-                        let depth = 0;
-                        let bracketEnd = -1;
-                        for (let i = bracketStart; i < rawDefaults.length; i++) {
-                            const ch = rawDefaults[i];
-                            if (ch === '"') {
-                                i++;
-                                while (i < rawDefaults.length) {
-                                    if (rawDefaults[i] === '\\') { i++; }
-                                    else if (rawDefaults[i] === '"') { break; }
-                                    i++;
-                                }
-                                continue;
-                            }
-                            if (ch === '[') depth++;
-                            if (ch === ']') {
-                                depth--;
-                                if (depth === 0) { bracketEnd = i; break; }
-                            }
-                        }
-                        if (bracketEnd !== -1) {
-                            rawDefaults = rawDefaults.substring(0, bracketStart) + '[]' + rawDefaults.substring(bracketEnd + 1);
-                        }
-                    }
-
-                    // Apply
-                    const result = await client.applyChangesRaw(rawDefaults);
-
-                    if (result.diagnostics && result.diagnostics.length > 0) {
-                        const diagMsg = result.diagnostics.join('\n');
-                        vscode.window.showWarningMessage(`EFx: Library ${libraryId} created with diagnostics:\n${diagMsg}`);
+                    const diagnostics = await coreCreateLibrary(libraryId, description);
+                    if (diagnostics.length > 0) {
+                        vscode.window.showWarningMessage(`EFx: Library ${libraryId} created with diagnostics:\n${diagnostics.join('\n')}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Created library ${libraryId} ✓`);
                     }
-
-                    await treeProvider.refresh();
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Create library failed: ${err.message}`);
                 }
@@ -1400,24 +1406,12 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Adding table ${tableId}...` },
             async () => {
                 try {
-                    let raw = await client.getLibraryRaw(libraryId);
-                    const newRow = JSON.stringify({
-                        LibraryID: libraryId,
-                        TableID: tableId,
-                        Updatable: updatablePick.value,
-                        SysRevID: 0,
-                        SysRowID: '00000000-0000-0000-0000-000000000000',
-                        RowMod: 'A'
-                    });
-                    raw = injectRowIntoArray(raw, 'EfxRefTable', newRow);
-                    const result = await client.applyChangesRaw(raw);
-                    if (result.diagnostics && result.diagnostics.length > 0) {
-                        vscode.window.showWarningMessage(`EFx: Table added with diagnostics: ${result.diagnostics.join(', ')}`);
+                    const diagnostics = await coreAddReference(libraryId, 'table', tableId, { updatable: updatablePick.value });
+                    if (diagnostics.length > 0) {
+                        vscode.window.showWarningMessage(`EFx: Table added with diagnostics: ${diagnostics.join(', ')}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Added table ${tableId} to ${libraryId} ✓`);
                     }
-                    treeProvider.invalidateCache(libraryId);
-                    treeProvider._onDidChangeTreeData.fire(undefined);
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Add table failed: ${err.message}`);
                 }
@@ -1445,17 +1439,7 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Updating ${tableId}...` },
             async () => {
                 try {
-                    const rawTableset = await client.getLibraryRaw(libraryId);
-                    const updatedRaw  = markEfxRefTableUpdatable(rawTableset, tableId, pick.value);
-                    const result      = await client.applyChangesRaw(updatedRaw);
-                    const diags       = result.diagnostics || [];
-                    const hasErrors   = diags.some(d => typeof d === "object" ? (d.Severity ?? 2) >= 2 : /\berror\b/i.test(String(d)));
-                    if (hasErrors) {
-                        const msg = diags.map(d => typeof d === "object" ? d.ErrorText || JSON.stringify(d) : String(d)).join("\n");
-                        throw new Error(`Server rejected update:\n${msg}`);
-                    }
-                    treeProvider.invalidateCache(libraryId);
-                    treeProvider._onDidChangeTreeData.fire(undefined);
+                    await coreSetTableUpdatable(libraryId, tableId, pick.value);
                     vscode.window.showInformationMessage(`EFx: ${tableId} set to ${pick.value ? "Updatable" : "Read-only"} ✓`);
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Set updatable failed: ${err.message}`);
@@ -1512,23 +1496,12 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Adding service ${serviceId}...` },
             async () => {
                 try {
-                    let raw = await client.getLibraryRaw(libraryId);
-                    const newRow = JSON.stringify({
-                        LibraryID: libraryId,
-                        ServiceID: serviceId,
-                        SysRevID: 0,
-                        SysRowID: '00000000-0000-0000-0000-000000000000',
-                        RowMod: 'A'
-                    });
-                    raw = injectRowIntoArray(raw, 'EfxRefService', newRow);
-                    const result = await client.applyChangesRaw(raw);
-                    if (result.diagnostics && result.diagnostics.length > 0) {
-                        vscode.window.showWarningMessage(`EFx: Service added with diagnostics: ${result.diagnostics.join(', ')}`);
+                    const diagnostics = await coreAddReference(libraryId, 'service', serviceId, {});
+                    if (diagnostics.length > 0) {
+                        vscode.window.showWarningMessage(`EFx: Service added with diagnostics: ${diagnostics.join(', ')}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Added service ${serviceId} to ${libraryId} ✓`);
                     }
-                    treeProvider.invalidateCache(libraryId);
-                    treeProvider._onDidChangeTreeData.fire(undefined);
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Add service failed: ${err.message}`);
                 }
@@ -1588,23 +1561,12 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Adding assembly ${assembly}...` },
             async () => {
                 try {
-                    let raw = await client.getLibraryRaw(libraryId);
-                    const newRow = JSON.stringify({
-                        LibraryID: libraryId,
-                        Assembly: assembly,
-                        SysRevID: 0,
-                        SysRowID: '00000000-0000-0000-0000-000000000000',
-                        RowMod: 'A'
-                    });
-                    raw = injectRowIntoArray(raw, 'EfxRefAssembly', newRow);
-                    const result = await client.applyChangesRaw(raw);
-                    if (result.diagnostics && result.diagnostics.length > 0) {
-                        vscode.window.showWarningMessage(`EFx: Assembly added with diagnostics: ${result.diagnostics.join(', ')}`);
+                    const diagnostics = await coreAddReference(libraryId, 'assembly', assembly, {});
+                    if (diagnostics.length > 0) {
+                        vscode.window.showWarningMessage(`EFx: Assembly added with diagnostics: ${diagnostics.join(', ')}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Added assembly ${assembly} to ${libraryId} ✓`);
                     }
-                    treeProvider.invalidateCache(libraryId);
-                    treeProvider._onDidChangeTreeData.fire(undefined);
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Add assembly failed: ${err.message}`);
                 }
@@ -1662,24 +1624,12 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Adding library ref ${libraryRef}...` },
             async () => {
                 try {
-                    let raw = await client.getLibraryRaw(libraryId);
-                    const newRow = JSON.stringify({
-                        LibraryID: libraryId,
-                        LibraryRef: libraryRef,
-                        Mode: modePick.value,
-                        SysRevID: 0,
-                        SysRowID: '00000000-0000-0000-0000-000000000000',
-                        RowMod: 'A'
-                    });
-                    raw = injectRowIntoArray(raw, 'EfxRefLibrary', newRow);
-                    const result = await client.applyChangesRaw(raw);
-                    if (result.diagnostics && result.diagnostics.length > 0) {
-                        vscode.window.showWarningMessage(`EFx: Library ref added with diagnostics: ${result.diagnostics.join(', ')}`);
+                    const diagnostics = await coreAddReference(libraryId, 'library', libraryRef, { mode: modePick.value });
+                    if (diagnostics.length > 0) {
+                        vscode.window.showWarningMessage(`EFx: Library ref added with diagnostics: ${diagnostics.join(', ')}`);
                     } else {
                         vscode.window.showInformationMessage(`EFx: Added library ref ${libraryRef} to ${libraryId} ✓`);
                     }
-                    treeProvider.invalidateCache(libraryId);
-                    treeProvider._onDidChangeTreeData.fire(undefined);
                 } catch (err) {
                     vscode.window.showErrorMessage(`EFx: Add library ref failed: ${err.message}`);
                 }
@@ -2057,7 +2007,8 @@ function activate(context) {
 
         // BPM widget code gets the same live syntax checking pulled directives get.
         let functionDefinition = null;
-        if (isBpm && bpmClientInst) {
+        // buildFunctionDefinition only describes BO methods — data/UBAQ directives skip validation.
+        if (isBpm && bpmClientInst && (meta.source || "BO") === "BO") {
             try {
                 const tableset = await bpmClientInst.getBpmMethod("BO", meta.bpMethodCode);
                 const method = tableset?.BpMethod?.[0];
@@ -2070,8 +2021,9 @@ function activate(context) {
         const header = (isBpm
             ? [
                 `// BPM Directive: ${meta.name}`,
+                `// Source: ${meta.source || "BO"}`,
                 `// Method: ${meta.bpMethodCode}`,
-                `// Type: ${typeLabelOf(meta.directiveType)}`,
+                `// Type: ${typeLabelOf(meta.directiveType, meta.source || "BO")}`,
                 `// DirectiveID: ${meta.directiveId}`,
             ]
             : [
@@ -2100,6 +2052,7 @@ function activate(context) {
             libraryId: isBpm ? "__BPM__" : meta.libraryId,
             functionId: isBpm ? meta.directiveId : meta.functionId,
             bpmMethodCode: meta.bpMethodCode,
+            source: meta.source || "BO",
             directiveId: meta.directiveId,
             directiveType: meta.directiveType,
             functionDefinition,
@@ -2114,6 +2067,55 @@ function activate(context) {
         }
     }));
 
+    // Writes a pulled directive's code file + fileMap entry. Shared by the pull
+    // command and the Claude bridge. Returns { filePath, typeLabel, functionDefinition }.
+    async function writeDirectiveFile(directive, code, profileRoot) {
+        const source = bpmClient_1.bpmSourceOf(directive);
+        const typeLabel = bpmClient_1.directiveTypeLabel(source, directive.DirectiveType);
+        const bpmDir = path.join(profileRoot, 'BPM', bpmMethodDirName(directive.BpMethodCode));
+        fs.mkdirSync(bpmDir, { recursive: true });
+
+        const safeName = directive.Name.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+        const filePath = path.join(bpmDir, `${typeLabel}_${safeName}.cs`);
+
+        const header = [
+            `// BPM Directive: ${directive.Name}`,
+            `// Source: ${source}`,
+            `// Method: ${directive.BpMethodCode}`,
+            `// Type: ${typeLabel}`,
+            `// Enabled: ${directive.IsEnabled}`,
+            `// Group: ${directive.DirectiveGroup || '(none)'}`,
+            `// DirectiveID: ${directive.DirectiveID}`,
+            `// Pulled: ${new Date().toISOString()}`,
+            `// --------------------------------------------------`,
+            ``,
+        ].join('\n');
+
+        fs.writeFileSync(filePath, header + code, 'utf-8');
+
+        // Store mapping for push + validation. buildFunctionDefinition only
+        // describes BO methods — data/UBAQ directives skip validation.
+        let functionDefinition = null;
+        if (source === 'BO') {
+            const tableset = await bpmClientInst.getBpmMethod('BO', directive.BpMethodCode);
+            const method = tableset?.BpMethod?.[0];
+            const args = tableset?.BpArgument || [];
+            functionDefinition = method ? bpmClient_1.buildFunctionDefinition(method, args) : null;
+        }
+
+        fileMap.set(normalizeFsPath(filePath), {
+            libraryId: '__BPM__',
+            functionId: directive.DirectiveID,
+            bpmMethodCode: directive.BpMethodCode,
+            source,
+            directiveId: directive.DirectiveID,
+            directiveType: directive.DirectiveType,
+            isBpm: true,
+            functionDefinition,
+        });
+
+        return { filePath, typeLabel, functionDefinition };
+    }
     // ── BPM: Pull Directive Code ──
     context.subscriptions.push(vscode.commands.registerCommand("efx.bpm.pullDirective", async (nodeOrArg) => {
         if (!bpmClientInst) {
@@ -2141,53 +2143,12 @@ function activate(context) {
             { location: vscode.ProgressLocation.Notification, title: `Pulling BPM: ${directive.Name}...` },
             async () => {
                 try {
-                    const typeLabel = directive.DirectiveType === 1 ? 'Pre'
-                        : directive.DirectiveType === 3 ? 'Post'
-                            : directive.DirectiveType === 2 ? 'Base'
-                                : `Type${directive.DirectiveType}`;
-
                     const profileRoot = await getProfileStorageRoot();
                     if (!profileRoot) {
                         vscode.window.showWarningMessage('BPM: Storage location not set — pull cancelled.');
                         return;
                     }
-                    const bpmDir = path.join(profileRoot, 'BPM', directive.BpMethodCode);
-                    fs.mkdirSync(bpmDir, { recursive: true });
-
-                    const safeName = directive.Name.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
-                    const filePath = path.join(bpmDir, `${typeLabel}_${safeName}.cs`);
-
-                    const header = [
-                        `// BPM Directive: ${directive.Name}`,
-                        `// Method: ${directive.BpMethodCode}`,
-                        `// Type: ${typeLabel}`,
-                        `// Enabled: ${directive.IsEnabled}`,
-                        `// Group: ${directive.DirectiveGroup || '(none)'}`,
-                        `// DirectiveID: ${directive.DirectiveID}`,
-                        `// Pulled: ${new Date().toISOString()}`,
-                        `// --------------------------------------------------`,
-                        ``,
-                    ].join('\n');
-
-                    fs.writeFileSync(filePath, header + code, 'utf-8');
-
-                    // Store mapping for push + validation
-                    const tableset = await bpmClientInst.getBpmMethod('BO', directive.BpMethodCode);
-                    const method = tableset?.BpMethod?.[0];
-                    const args = tableset?.BpArgument || [];
-                    const functionDefinition = (method)
-                        ? bpmClient_1.buildFunctionDefinition(method, args)
-                        : null;
-
-                    fileMap.set(normalizeFsPath(filePath), {
-                        libraryId: '__BPM__',
-                        functionId: directive.DirectiveID,
-                        bpmMethodCode: directive.BpMethodCode,
-                        directiveId: directive.DirectiveID,
-                        directiveType: directive.DirectiveType,
-                        isBpm: true,
-                        functionDefinition,
-                    });
+                    const { filePath, typeLabel, functionDefinition } = await writeDirectiveFile(directive, code, profileRoot);
 
                     const doc = await vscode.workspace.openTextDocument(filePath);
                     await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
@@ -2204,6 +2165,27 @@ function activate(context) {
             }
         );
     }));
+    // Pushes a pulled directive file's code into its directive and verifies it
+    // landed. Throws on failure. Shared by the push command and the Claude bridge.
+    async function corePushDirective(filePath, mapping) {
+        const fileContent = stripGeneratedHeader(fs.readFileSync(filePath, 'utf-8'));
+        const source = mapping.source || 'BO';
+        // Get fresh raw tableset, inject new code, set RowMod U on the target directive
+        const rawTableset = await bpmClientInst.getBpmMethodRaw(source, mapping.bpmMethodCode);
+        const updatedRaw = bpmClient_1.updateRawBpmDirective(rawTableset, mapping.directiveId, fileContent);
+        // Validate JSON before sending
+        JSON.parse(`{"ds":${updatedRaw}}`);
+        const result = await bpmClientInst.updateBpmRaw(updatedRaw);
+        const errs = (result?.returnObj?.BpMessageSvc || []).filter(m => m.Severity > 1);
+        if (errs.length) throw new Error(errs.map(e => e.Message).join('; '));
+        // Verify against the server copy
+        const ts = await bpmClientInst.getBpmMethod(source, mapping.bpmMethodCode);
+        const row = (ts?.BpDirective || []).find(d => d.DirectiveID === mapping.directiveId);
+        const saved = row ? bpmClient_1.extractBpmCode(row.Body).code : null;
+        if (saved === null || efxBody_1.normalizeCode(saved) !== efxBody_1.normalizeCode(fileContent)) {
+            throw new Error('BPM push verification failed: server directive code does not match the file.');
+        }
+    }
     // ── BPM: Push Directive Code ──
     context.subscriptions.push(vscode.commands.registerCommand("efx.bpm.pushDirective", async (node) => {
         if (!bpmClientInst) {
@@ -2217,17 +2199,14 @@ function activate(context) {
         if (node && node.directive) {
             // Called from tree — find the pulled file
             const directive = node.directive;
-            const typeLabel = directive.DirectiveType === 1 ? 'Pre'
-                : directive.DirectiveType === 3 ? 'Post'
-                    : directive.DirectiveType === 2 ? 'Base'
-                        : `Type${directive.DirectiveType}`;
+            const typeLabel = bpmClient_1.directiveTypeLabel(bpmClient_1.bpmSourceOf(directive), directive.DirectiveType);
             const safeName = directive.Name.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
             const profileRoot = await getProfileStorageRoot();
             if (!profileRoot) {
                 vscode.window.showWarningMessage('BPM: Storage location not set — push cancelled.');
                 return;
             }
-            filePath = path.join(profileRoot, 'BPM', directive.BpMethodCode, `${typeLabel}_${safeName}.cs`);
+            filePath = path.join(profileRoot, 'BPM', bpmMethodDirName(directive.BpMethodCode), `${typeLabel}_${safeName}.cs`);
             mapping = await resolveMapping(filePath);
         } else {
             // Called from command palette / active editor
@@ -2269,26 +2248,7 @@ function activate(context) {
             async () => {
                 try {
                     await saveOpenDocumentIfDirty(filePath);
-
-                    // Read edited code, strip header
-                    let fileContent = fs.readFileSync(filePath, 'utf-8');
-                    fileContent = stripGeneratedHeader(fileContent);
-
-                    // Get fresh raw tableset
-                    const rawTableset = await bpmClientInst.getBpmMethodRaw('BO', mapping.bpmMethodCode);
-
-                    // Inject new code and set RowMod U on the target directive
-                    const updatedRaw = bpmClient_1.updateRawBpmDirective(
-                        rawTableset,
-                        mapping.directiveId,
-                        fileContent
-                    );
-
-                    // Validate JSON before sending
-                    JSON.parse(`{"ds":${updatedRaw}}`);
-
-                    // Push
-                    await bpmClientInst.updateBpmRaw(updatedRaw);
+                    await corePushDirective(filePath, mapping);
 
                     vscode.window.showInformationMessage(`BPM: Pushed directive to ${mapping.bpmMethodCode} ✓`);
 
@@ -2300,7 +2260,9 @@ function activate(context) {
                     // Invalidate cache so tree refreshes
                     const parts = mapping.bpmMethodCode.split('.');
                     // BpMethodCode = Erp.BO.JobEntry.Update -> SystemCode=ERP, ServiceKind=BO, ServiceName=JobEntry
-                    if (parts.length >= 3) {
+                    if ((mapping.source || 'BO') !== 'BO') {
+                        bpmTreeProvider.invalidateSource(mapping.source);
+                    } else if (parts.length >= 3) {
                         bpmTreeProvider.invalidateService(parts[0].toUpperCase(), parts[1], parts[2]);
                     }
                 } catch (err) {
@@ -2536,12 +2498,13 @@ function activate(context) {
         out.appendLine(`Fetching ${methodCode}...`);
 
         try {
-            const ts = await bpmClientInst.getBpmMethod("BO", methodCode.trim());
+            const dumpSource = bpmClient_1.inferBpmSource(methodCode.trim());
+            const ts = await bpmClientInst.getBpmMethod(dumpSource, methodCode.trim());
             const dirs = ts?.BpDirective || [];
             out.appendLine(`Got ${dirs.length} directive(s)\n`);
 
             for (const d of dirs) {
-                const typeLabel = d.DirectiveType === 1 ? "Pre" : d.DirectiveType === 3 ? "Post" : "Base";
+                const typeLabel = bpmClient_1.directiveTypeLabel(dumpSource, d.DirectiveType);
                 out.appendLine("=".repeat(70));
                 out.appendLine(`[${typeLabel}] "${d.Name}"  enabled=${d.IsEnabled}  group=${d.DirectiveGroup || "(none)"}`);
 
@@ -2593,6 +2556,30 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand("efx.searchInLibrary", async (node) => {
         await openFunctionSearch(client, { libraryId: node?.library?.LibraryID || node?.libraryId });
     }));
+
+    // ── Claude bridge (EFx MCP server in mcp/) ──
+    // Everything the bridge may touch, passed explicitly. Getters for anything
+    // reassigned on profile switch.
+    const claudeApi = {
+        context,
+        getClient: () => client,
+        getBpmClient: () => bpmClientInst,
+        treeProvider: () => treeProvider,
+        bpmTreeProvider: () => bpmTreeProvider,
+        clientReady: () => clientReady,
+        getProfiles, setProfiles, getActiveProfileName, setActiveProfileName, getActiveProfile, getActiveCompany,
+        profileRootNoPrompt, profileSecretKey,
+        activateProfile: name => activateProfile(context, name),
+        applyActiveCompany: company => applyActiveCompany(context, company),
+        normalizeFsPath, stripGeneratedHeaderInfo, formatBOUpdErrors, bpmMethodDirName,
+        resolveMapping, pushWidgetCodeFile,
+        pushFunctionCommand: node => vscode.commands.executeCommand("efx.pushFunction", node, true),
+        buildLibraryFiles, writePulledFiles, collectAllLibraryFiles,
+        writeDirectiveFile, corePushDirective,
+        coreCreateFunction, coreDeleteFunction, coreCreateLibrary, coreAddReference, coreSetTableUpdatable,
+        efxDiagnostics, pulledTablesets, clearSearchCache,
+    };
+    new ClaudeBridge(context, claudeApi, claudeOps_1.buildOps(claudeApi)).start();
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile management
@@ -2932,8 +2919,23 @@ async function runProfileEditor(context, draft, isNew) {
     if (autoCleanPick === undefined) return false;
     draft.autoClean = autoCleanPick.value;
 
+    // Step 9: what Claude (via the EFx MCP server) may do while this profile is active.
+    // Only settable here — the Claude bridge can never change it.
+    const accessPick = await vscode.window.showQuickPick(
+        CLAUDE_ACCESS_LEVELS.map(l => ({ ...l, description: (draft.claudeAccess || "off") === l.value ? "current" : "" })),
+        { placeHolder: "Claude access for this profile (EFx MCP server)", ignoreFocusOut: true }
+    );
+    if (accessPick === undefined) return false;
+    draft.claudeAccess = accessPick.value;
+
     return true;
 }
+const CLAUDE_ACCESS_LEVELS = [
+    { label: "Off — Claude can't use this profile", value: "off" },
+    { label: "Read — list, search, pull, compare", value: "read" },
+    { label: "Read + write — push, create/delete, references, signatures, execute, profiles", value: "write" },
+    { label: "Read + write + risky — also promote/demote libraries", value: "risky" },
+];
 
 // Resolves the company list for a profile draft.
 // On new profiles → asks for a default/seed company, fetches the list, multi-selects.
@@ -3257,6 +3259,14 @@ async function getProfileStorageRoot() {
     const safeProfile = profileName.replace(/[^a-zA-Z0-9_\-. ]/g, '_');
     return path.join(base, safeProfile);
 }
+// Same path as getProfileStorageRoot for any profile, but never prompts —
+// null when no storage location is configured. Used by the Claude bridge.
+function profileRootNoPrompt(profileName) {
+    const configured = vscode.workspace.getConfiguration('efx').get('storageLocation');
+    const base = configured && String(configured).trim();
+    if (!base || !profileName) return null;
+    return path.join(base, String(profileName).replace(/[^a-zA-Z0-9_\-. ]/g, '_'));
+}
 async function getEfxDir() {
     const root = await getProfileStorageRoot();
     return root ? path.join(root, "Libraries") : null;
@@ -3264,6 +3274,11 @@ async function getEfxDir() {
 async function getKineticDir() {
     const root = await getProfileStorageRoot();
     return root ? path.join(root, "Kinetic") : null;
+}
+// Folder name for a BPM method code. UBAQ codes contain "<company>/<query>" —
+// the slash would nest folders. Method/data codes pass through unchanged.
+function bpmMethodDirName(bpMethodCode) {
+    return String(bpMethodCode || "").replace(/[^a-zA-Z0-9_\-. ]/g, "_");
 }
 // Reads the metadata header written into pulled .cs files (library/function
 // name, or BPM method/directive/type) so a file can be re-identified later.
@@ -3290,6 +3305,7 @@ function hostFromWidgetMeta(meta) {
         if (!bpmClientInst) return null;
         return createBpmHost(bpmClientInst, {
             DirectiveID: meta.directiveId,
+            Source: meta.source || 'BO',
             BpMethodCode: meta.bpMethodCode,
             Name: meta.name,
             DirectiveType: meta.directiveType,
@@ -3303,10 +3319,10 @@ async function pushWidgetCodeFile(filePath, mapping) {
     const host = hostFromWidgetMeta(mapping.widgetMeta);
     if (!host) {
         vscode.window.showWarningMessage('EFx: Configure connection first');
-        return;
+        return { ok: false, message: 'EFx: Configure connection first' };
     }
     const { content } = stripGeneratedHeaderInfo(fs.readFileSync(filePath, 'utf-8'));
-    await vscode.window.withProgress(
+    return await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `Pushing widget ${mapping.nodeId}...` },
         async () => {
             try {
@@ -3316,8 +3332,10 @@ async function pushWidgetCodeFile(filePath, mapping) {
                     treeProvider.invalidateCache(mapping.widgetMeta.libraryId);
                     clearSearchCache();
                 }
+                return { ok: true, message: `${host.heading}: widget "${mapping.nodeId}" saved.` };
             } catch (err) {
                 vscode.window.showErrorMessage(`Widget push failed: ${err.message}`);
+                return { ok: false, message: `Widget push failed: ${err.message}` };
             }
         });
 }
@@ -3340,18 +3358,22 @@ async function resolveMapping(filePath) {
         if (!bpmClientInst) return null;
         const bpmMethodCode = fields['Method'];
         const directiveId = fields['DirectiveID'];
-        const typeMap = { Pre: 1, Post: 3, Base: 2 };
-        const directiveType = typeMap[fields['Type']] ?? parseInt(String(fields['Type']).replace('Type', ''), 10);
+        // Files pulled before the Source header existed are all method directives.
+        const source = bpmClient_1.bpmSourceOf({ Source: fields['Source'] });
+        const directiveType = bpmClient_1.directiveTypeFromLabel(source, fields['Type']);
         try {
-            const tableset = await bpmClientInst.getBpmMethod('BO', bpmMethodCode);
-            const method = tableset?.BpMethod?.[0];
-            const args = tableset?.BpArgument || [];
-            const functionDefinition = method ? bpmClient_1.buildFunctionDefinition(method, args) : null;
-            const mapping = { libraryId: '__BPM__', functionId: directiveId, bpmMethodCode, directiveId, directiveType, isBpm: true, functionDefinition };
+            let functionDefinition = null;
+            if (source === 'BO') {
+                const tableset = await bpmClientInst.getBpmMethod('BO', bpmMethodCode);
+                const method = tableset?.BpMethod?.[0];
+                const args = tableset?.BpArgument || [];
+                functionDefinition = method ? bpmClient_1.buildFunctionDefinition(method, args) : null;
+            }
+            const mapping = { libraryId: '__BPM__', functionId: directiveId, bpmMethodCode, source, directiveId, directiveType, isBpm: true, functionDefinition };
             if (widgetCodeId) {
                 mapping.isWidgetCode = true;
                 mapping.nodeId = widgetCodeId;
-                mapping.widgetMeta = { kind: 'bpm', bpMethodCode, directiveId, directiveType, name: fields['BPM Directive'] };
+                mapping.widgetMeta = { kind: 'bpm', source, bpMethodCode: bpmMethodCode, directiveId, directiveType, name: fields['BPM Directive'] };
             }
             fileMap.set(normalized, mapping);
             return mapping;

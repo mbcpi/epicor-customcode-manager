@@ -31,3 +31,7 @@ efx_validate_payload.json
 node_modules/
 *.vsix
 *.vsix.zip
+
+# MCP bundle build output
+mcp/dist/
+*.mcpb

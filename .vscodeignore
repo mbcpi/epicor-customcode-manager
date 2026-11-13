@@ -4,3 +4,14 @@ node_modules/
 probe-bpm-widgets.js
 install-local.sh
 **/*.map
+mcp/
+.github/
+.vscode/
+scripts/
+.gitignore
+update-extension.sh
+*.diff
+*.vsix
+*.mcpb
+**/*.efxb
+images/hero.png
