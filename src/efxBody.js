@@ -87,4 +87,17 @@ function bodyKindLabel(desc) {
     return `Widget flow — ${desc.flow.nodeCount} widgets, ${n} with custom code`;
 }
 
-module.exports = { describeBody, packFlowXaml, setBodyNodeCode, bodyCodeText, bodyKindLabel };
+// Code text for "did it change?" comparisons: line endings unified, trailing
+// whitespace per line dropped, blank lines trimmed off both ends. Whitespace-only
+// drift (pull/push round trips, editors trimming) must never read as a change.
+function normalizeCode(code) {
+    return String(code || '')
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map(l => l.replace(/[ \t]+$/, ''))
+        .join('\n')
+        .replace(/^\n+/, '')
+        .replace(/\n+$/, '');
+}
+
+module.exports = { describeBody, packFlowXaml, setBodyNodeCode, bodyCodeText, bodyKindLabel, normalizeCode };

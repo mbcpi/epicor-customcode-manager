@@ -441,6 +441,13 @@ class EpicorClient {
             throw wrapperErr;
         }
 
+        return this._parseWrapperOutput(result, code, usings);
+    }
+
+    // Turns a FunctionUtilities.ApplyChangesWithDiagnostics response into
+    // { saved, diagnostics, errors, outResult, outMsg, raw, newBody }. `code` is
+    // the code that was sent, used to calibrate server line numbers.
+    _parseWrapperOutput(result, code, usings) {
         const outMsg = result?.outMsg ?? result?.parameters?.outMsg ?? '';
         const outResult = result?.outResult ?? result?.parameters?.outResult ?? '';
         const outSuccess = result?.outSuccess ?? result?.parameters?.outSuccess ?? false;
@@ -524,6 +531,51 @@ class EpicorClient {
             raw: result,
             newBody: EpicorClient.packCode(code, usings || ''),
         };
+    }
+
+    // Batch save: several code functions of ONE library in a single wrapper
+    // call (inFunctionID = "" → one ApplyChanges, one compile, all-or-nothing).
+    // items: [{ functionId, code, usings }]. tableset: a fresh parsed GetLibrary
+    // result (row metadata only — the wrapper re-reads the live tableset).
+    // Returns { saved, perFunction: { [functionId]: parsed result }, outMsg, outResult, oldWrapper }.
+    // oldWrapper=true means the server still runs the single-function wrapper.
+    async applyFunctionsViaWrapper(libraryId, items, tableset, wrapperLibrary = 'Utilities', wrapperFn = 'ApplyChangesWithDiagnostics') {
+        const libRow = { ...tableset.EfxLibrary[0], RowMod: 'U' };
+        const funcRows = items.map(it => {
+            const src = tableset.EfxFunction.find(f => f.FunctionID === it.functionId);
+            if (!src) throw new Error(`Function '${it.functionId}' not found in library '${libraryId}'`);
+            return { ...src, Code: it.code, Usings: it.usings || '', Body: '', RowMod: 'U' };
+        });
+        const result = await this.request(
+            this.getEfxUrl(wrapperLibrary, wrapperFn),
+            { inFunctionID: '', inDS: { EfxLibrary: [libRow], EfxFunction: funcRows } }
+        );
+        const outMsg = result?.outMsg ?? result?.parameters?.outMsg ?? '';
+        const outResult = result?.outResult ?? result?.parameters?.outResult ?? '';
+        if (/FunctionID '' not found in inDS\.EfxFunction/.test(outMsg)) {
+            return { saved: false, perFunction: {}, outMsg, outResult, oldWrapper: true };
+        }
+
+        // Compiler lines name their file ("MyFunc.cs(12,5): error CS…"). Route
+        // each to its function; lines without a file go to every function.
+        const lines = String(outMsg).split(/\r?\n/);
+        const ids = items.map(it => it.functionId);
+        const ownerOf = line => {
+            const m = line.match(/(?:^|[\s:\\/])([A-Za-z_][A-Za-z0-9_]*)\.cs\(\d+,\d+\)/);
+            return m && ids.includes(m[1]) ? m[1] : null;
+        };
+        const general = lines.filter(l => /^(Error|Unexpected|Message|Inner):/i.test(l) && !ownerOf(l));
+        const perFunction = {};
+        for (const it of items) {
+            const own = lines.filter(l => ownerOf(l) === it.functionId);
+            const fakeMsg = [...own, ...general, ...(/Saved Successfully/i.test(outMsg) ? ['Saved Successfully'] : [])].join('\n');
+            const outSuccess = result?.outSuccess ?? result?.parameters?.outSuccess ?? false;
+            perFunction[it.functionId] = this._parseWrapperOutput(
+                { outMsg: fakeMsg, outResult, outSuccess }, it.code, it.usings);
+        }
+        const saved = (result?.outSuccess ?? result?.parameters?.outSuccess) === true
+            || (/Saved Successfully/i.test(outMsg) && !lines.some(l => /^Error:/i.test(l)));
+        return { saved, perFunction, outMsg, outResult, oldWrapper: false };
     }
 
     _patchFunctionBody(rawTableset, functionId, newBodyString, rowMod) {

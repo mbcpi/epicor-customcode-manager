@@ -10,6 +10,48 @@ const DIRECTIVE_TYPE = {
 };
 exports.DIRECTIVE_TYPE = DIRECTIVE_TYPE;
 
+// BpMethod.Source values: BO = method directives, DB = data directives,
+// DQ = updatable BAQ directives. DB numbers its types differently.
+const BPM_SOURCES = ['BO', 'DB', 'DQ'];
+exports.BPM_SOURCES = BPM_SOURCES;
+const TYPE_LABELS = {
+    BO: { 1: 'Pre', 2: 'Base', 3: 'Post' },
+    DQ: { 1: 'Pre', 2: 'Base', 3: 'Post' },
+    DB: { 0: 'InTran', 1: 'Standard' },
+};
+
+// Source of a directive/method row. The column is nchar, so trim; rows from
+// older callers carry no Source at all and are method directives.
+function bpmSourceOf(row) {
+    const s = String(row?.Source ?? row?.source ?? '').trim().toUpperCase();
+    return BPM_SOURCES.includes(s) ? s : 'BO';
+}
+exports.bpmSourceOf = bpmSourceOf;
+
+function directiveTypeLabel(source, directiveType) {
+    return TYPE_LABELS[source || 'BO']?.[directiveType] || `Type${directiveType}`;
+}
+exports.directiveTypeLabel = directiveTypeLabel;
+
+function directiveTypeFromLabel(source, label) {
+    const map = TYPE_LABELS[source || 'BO'] || {};
+    for (const [type, l] of Object.entries(map)) {
+        if (l === label) return parseInt(type, 10);
+    }
+    return parseInt(String(label).replace('Type', ''), 10);
+}
+exports.directiveTypeFromLabel = directiveTypeFromLabel;
+
+// Best guess for a bare method code: UBAQ codes carry "<company>/<query>",
+// data directive codes are <System>.<Table>.Update, everything else is BO.
+function inferBpmSource(bpMethodCode) {
+    const code = String(bpMethodCode || '');
+    if (code.includes('/')) return 'DQ';
+    if (code.split('.').length === 3) return 'DB';
+    return 'BO';
+}
+exports.inferBpmSource = inferBpmSource;
+
 // XML entity encode/decode for BPM Body XAML
 function xmlEncode(str) {
     return str
@@ -232,10 +274,10 @@ class BpmClient {
     }
 
     // ── Get methods for a service (with directive presence flags) ──
-    async getBpmMethodsByService(systemCode, serviceKind, serviceName) {
+    async getBpmMethodsByService(systemCode, serviceKind, serviceName, source = 'BO') {
         // Use GetRowsEx with a where clause on the method
         const result = await this.request(this.getBpmUrl('GetRowsEx'), {
-            source: 'BO',
+            source,
             whereClauseBpMethod: `SystemCode = '${systemCode}' and ObjectNS = '${serviceKind}' and BusinessObject = '${serviceName}'`,
             whereClauseBpDirective: '',
             pageSize: 500,
@@ -278,8 +320,8 @@ class BpmClient {
         }
     }
     // ── All methods + directives for one source in a single call ──
-    // Used for data directives (source 'DB'), which aren't listed by
-    // GetBpmDirectiveServicesTS the way method directives are.
+    // Used for data directives (source 'DB') and UBAQ directives (source 'DQ'),
+    // which aren't listed by GetBpmDirectiveServicesTS the way method directives are.
     async getBpmRowsBySource(source) {
         const result = await this.request(this.getBpmUrl('GetRowsEx'), {
             source,

@@ -9,7 +9,7 @@ const CompareLayers = require("./compareLayers");
 // injected after the panel's main <script>.
 const COMPARE_WEBVIEW_JS = require("./compareWebview.txt");
 const { directiveToCanonicalText } = require("./widgetXaml");
-const { describeBody } = require("./efxBody");
+const { describeBody, normalizeCode } = require("./efxBody");
 const { KineticMetaFXClient } = require("./kineticLayerClient");
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -70,7 +70,8 @@ function buildFnMap(data) {
 function compareFn(fa, fb) {
     const fields = {}; let hasDiff = false;
     for (const [key, label] of [['_code', 'Code'], ['_usings', 'Usings']]) {
-        const va = fa[key] || '', vb = fb[key] || '', same = va === vb;
+        // Whitespace-only drift between environments is not a difference.
+        const va = fa[key] || '', vb = fb[key] || '', same = normalizeCode(va) === normalizeCode(vb);
         if (!same) hasDiff = true;
         fields[label] = { a: va, b: vb, same };
     }
@@ -171,6 +172,116 @@ function normalizeJson(str) {
 // COMPARE PANEL
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Fetch every library from both environments and diff them. Shared by the
+// panel and the Claude bridge. status(text) reports progress.
+async function compareFunctionsData(cA, cB, profileA, profileB, status = () => {}) {
+    status('Fetching library lists…');
+    const [libListA, libListB] = await Promise.all([cA.getLibraryList(), cB.getLibraryList()]);
+    const allIds = [...new Set([...libListA.map(l => l.LibraryID), ...libListB.map(l => l.LibraryID)])];
+    status(`Fetching ${allIds.length} libraries from both environments…`);
+    const [rawA, rawB] = await Promise.all([
+        cA.request(cA.getDesignerUrl('GetLibraries'), { libraryIds: allIds }),
+        cB.request(cB.getDesignerUrl('GetLibraries'), { libraryIds: allIds }),
+    ]);
+    status('Computing diff…');
+    // request() hands back the raw string when a 2xx body isn't JSON.
+    // Feeding that to buildFnMap yields empty maps, which would render
+    // as "every library is only in the other environment" — a silently
+    // wrong diff. Treat a non-object response as the failure it is.
+    for (const [raw, label] of [[rawA, profileA], [rawB, profileB]]) {
+        if (!raw || typeof raw !== 'object') {
+            throw new Error(`Unexpected GetLibraries response from ${label} — expected JSON, got ${typeof raw}.`);
+        }
+    }
+    const rA = rawA.returnObj || rawA, rB = rawB.returnObj || rawB;
+    const { fnMap: fnMapA, refMap: refMapA, libDetail: ldA } = buildFnMap(rA);
+    const { fnMap: fnMapB, refMap: refMapB, libDetail: ldB } = buildFnMap(rB);
+    const libraries = buildLibraryCompare(libListA, libListB, fnMapA, fnMapB, refMapA, refMapB, ldA, ldB);
+    const counts = { match: 0, diff: 0, 'only-a': 0, 'only-b': 0 };
+    for (const l of libraries) counts[l.status] = (counts[l.status] || 0) + 1;
+    return { meta: { env_a_name: profileA, env_b_name: profileB, counts, total: libraries.length }, libraries };
+}
+
+// Every BPM directive (method, data, UBAQ) from both environments, diffed.
+// Shared by the panel and the Claude bridge.
+async function compareBpmData(cA, cB, profileA, profileB, status = () => {}) {
+    const bA = new BpmClient(cA), bB = new BpmClient(cB);
+    const warnings = [];
+
+    // Method directives: same proven path as the BPM tree provider
+    // (GetBpmDirectiveServicesTS -> GetRowsEx per service, 6 at a time).
+    // Data (source 'DB') and UBAQ (source 'DQ') directives come from one GetRowsEx call each.
+    const fetchAll = async (bpm, label) => {
+        const services = await bpm.getBpmServices();
+        const CONCURRENCY = 6;
+        const results = new Array(services.length);
+        let next = 0;
+        const worker = async () => {
+            while (next < services.length) {
+                const i = next++;
+                const { SystemCode, ServiceKind, ServiceName } = services[i];
+                results[i] = await bpm.getBpmMethodsByService(SystemCode, ServiceKind, ServiceName);
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, services.length) }, worker));
+        const methods = [], directives = [];
+        for (const data of results) {
+            for (const m of data.methods) methods.push({ ...m, Source: m.Source || 'BO' });
+            for (const d of data.directives) directives.push({ ...d, Source: d.Source || 'BO' });
+        }
+        for (const [src, what] of [['DB', 'data'], ['DQ', 'UBAQ']]) {
+            try {
+                const rows = await bpm.getBpmRowsBySource(src);
+                for (const m of rows.methods) methods.push({ ...m, Source: src });
+                for (const d of rows.directives) directives.push({ ...d, Source: src });
+            } catch (e) {
+                warnings.push(`${label}: ${what} directives not loaded — ${e.message}`);
+            }
+        }
+        // A directive can only appear once per environment.
+        const seen = new Set();
+        return { methods, directives: directives.filter(d => {
+            const k = d.DirectiveID || CompareBpm.directiveKey(d);
+            if (seen.has(k)) return false; seen.add(k); return true;
+        }) };
+    };
+
+    status('Fetching BPM directives from both environments…');
+    const [dA, dB] = await Promise.all([fetchAll(bA, profileA), fetchAll(bB, profileB)]);
+
+    // Same directive stored as XAML on one side and Kinetic JSON on the
+    // other: let the server convert both to its JSON model.
+    const mixed = CompareBpm.mixedFormatPairs(dA.directives, dB.directives);
+    if (mixed.length) {
+        status(`Normalizing ${mixed.length} directive(s) stored in different formats…`);
+        let next = 0, failed = 0;
+        const worker = async () => {
+            while (next < mixed.length) {
+                const { a, b } = mixed[next++];
+                try {
+                    const [ja, jb] = await Promise.all([bA.getKineticDirective(a.DirectiveID), bB.getKineticDirective(b.DirectiveID)]);
+                    const ca = ja && CompareBpm.jsonToCanonical(ja), cb = jb && CompareBpm.jsonToCanonical(jb);
+                    if (!ca || !cb) { failed++; continue; }
+                    a._origFormat = CompareBpm.bodyFormat(a.Body); b._origFormat = CompareBpm.bodyFormat(b.Body);
+                    a._canon = { format: 'json', ...ca }; b._canon = { format: 'json', ...cb };
+                    a._normalized = b._normalized = true;
+                } catch { failed++; }
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(6, mixed.length) }, worker));
+        if (failed) warnings.push(`${failed} directive pair(s) stored as XAML vs JSON could not be normalized — they compare as raw text and will show as different.`);
+    }
+
+    status('Computing BPM diff…');
+    const bpmData = CompareBpm.buildBpmCompare(dA.methods, dA.directives, dB.methods, dB.directives);
+    bpmData.warnings = warnings;
+    return {
+        bpmData,
+        rawA: new Map(dA.directives.map(d => [CompareBpm.directiveKey(d), d.Body || ''])),
+        rawB: new Map(dB.directives.map(d => [CompareBpm.directiveKey(d), d.Body || ''])),
+    };
+}
+
 class ComparePanel {
     constructor(panel, context) {
         this.panel   = panel;
@@ -250,31 +361,8 @@ class ComparePanel {
         this._post({ command: 'compareStarted' });
         try {
             const [cA, cB] = await Promise.all([this._efxClient(profileA, companyA), this._efxClient(profileB, companyB)]);
-            this._post({ command: 'status', text: 'Fetching library lists…' });
-            const [libListA, libListB] = await Promise.all([cA.getLibraryList(), cB.getLibraryList()]);
-            const allIds = [...new Set([...libListA.map(l => l.LibraryID), ...libListB.map(l => l.LibraryID)])];
-            this._post({ command: 'status', text: `Fetching ${allIds.length} libraries from both environments…` });
-            const [rawA, rawB] = await Promise.all([
-                cA.request(cA.getDesignerUrl('GetLibraries'), { libraryIds: allIds }),
-                cB.request(cB.getDesignerUrl('GetLibraries'), { libraryIds: allIds }),
-            ]);
-            this._post({ command: 'status', text: 'Computing diff…' });
-            // request() hands back the raw string when a 2xx body isn't JSON.
-            // Feeding that to buildFnMap yields empty maps, which would render
-            // as "every library is only in the other environment" — a silently
-            // wrong diff. Treat a non-object response as the failure it is.
-            for (const [raw, label] of [[rawA, profileA], [rawB, profileB]]) {
-                if (!raw || typeof raw !== 'object') {
-                    throw new Error(`Unexpected GetLibraries response from ${label} — expected JSON, got ${typeof raw}.`);
-                }
-            }
-            const rA = rawA.returnObj || rawA, rB = rawB.returnObj || rawB;
-            const { fnMap: fnMapA, refMap: refMapA, libDetail: ldA } = buildFnMap(rA);
-            const { fnMap: fnMapB, refMap: refMapB, libDetail: ldB } = buildFnMap(rB);
-            const libraries = buildLibraryCompare(libListA, libListB, fnMapA, fnMapB, refMapA, refMapB, ldA, ldB);
-            const counts = { match: 0, diff: 0, 'only-a': 0, 'only-b': 0 };
-            for (const l of libraries) counts[l.status] = (counts[l.status] || 0) + 1;
-            this._post({ command: 'functionsReady', data: { meta: { env_a_name: profileA, env_b_name: profileB, counts, total: libraries.length }, libraries } });
+            const data = await compareFunctionsData(cA, cB, profileA, profileB, text => this._post({ command: 'status', text }));
+            this._post({ command: 'functionsReady', data });
         } catch (err) {
             this._post({ command: 'error', tab: 'functions', message: err.message });
         }
@@ -284,78 +372,11 @@ class ComparePanel {
         this._post({ command: 'status', text: 'Fetching BPM services…' });
         try {
             const [cA, cB] = await Promise.all([this._efxClient(profileA, companyA), this._efxClient(profileB, companyB)]);
-            const bA = new BpmClient(cA), bB = new BpmClient(cB);
-            const warnings = [];
-
-            // Method directives: same proven path as the BPM tree provider
-            // (GetBpmDirectiveServicesTS -> GetRowsEx per service, 6 at a time).
-            // Data directives (source 'DB') come from one GetRowsEx call.
-            const fetchAll = async (bpm, label) => {
-                const services = await bpm.getBpmServices();
-                const CONCURRENCY = 6;
-                const results = new Array(services.length);
-                let next = 0;
-                const worker = async () => {
-                    while (next < services.length) {
-                        const i = next++;
-                        const { SystemCode, ServiceKind, ServiceName } = services[i];
-                        results[i] = await bpm.getBpmMethodsByService(SystemCode, ServiceKind, ServiceName);
-                    }
-                };
-                await Promise.all(Array.from({ length: Math.min(CONCURRENCY, services.length) }, worker));
-                const methods = [], directives = [];
-                for (const data of results) {
-                    for (const m of data.methods) methods.push({ ...m, Source: m.Source || 'BO' });
-                    for (const d of data.directives) directives.push({ ...d, Source: d.Source || 'BO' });
-                }
-                try {
-                    const db = await bpm.getBpmRowsBySource('DB');
-                    for (const m of db.methods) methods.push({ ...m, Source: 'DB' });
-                    for (const d of db.directives) directives.push({ ...d, Source: 'DB' });
-                } catch (e) {
-                    warnings.push(`${label}: data directives not loaded — ${e.message}`);
-                }
-                // A directive can only appear once per environment.
-                const seen = new Set();
-                return { methods, directives: directives.filter(d => {
-                    const k = d.DirectiveID || CompareBpm.directiveKey(d);
-                    if (seen.has(k)) return false; seen.add(k); return true;
-                }) };
-            };
-
-            this._post({ command: 'status', text: 'Fetching BPM directives from both environments…' });
-            const [dA, dB] = await Promise.all([fetchAll(bA, profileA), fetchAll(bB, profileB)]);
-
-            // Same directive stored as XAML on one side and Kinetic JSON on the
-            // other: let the server convert both to its JSON model.
-            const mixed = CompareBpm.mixedFormatPairs(dA.directives, dB.directives);
-            if (mixed.length) {
-                this._post({ command: 'status', text: `Normalizing ${mixed.length} directive(s) stored in different formats…` });
-                let next = 0, failed = 0;
-                const worker = async () => {
-                    while (next < mixed.length) {
-                        const { a, b } = mixed[next++];
-                        try {
-                            const [ja, jb] = await Promise.all([bA.getKineticDirective(a.DirectiveID), bB.getKineticDirective(b.DirectiveID)]);
-                            const ca = ja && CompareBpm.jsonToCanonical(ja), cb = jb && CompareBpm.jsonToCanonical(jb);
-                            if (!ca || !cb) { failed++; continue; }
-                            a._origFormat = CompareBpm.bodyFormat(a.Body); b._origFormat = CompareBpm.bodyFormat(b.Body);
-                            a._canon = { format: 'json', ...ca }; b._canon = { format: 'json', ...cb };
-                            a._normalized = b._normalized = true;
-                        } catch { failed++; }
-                    }
-                };
-                await Promise.all(Array.from({ length: Math.min(6, mixed.length) }, worker));
-                if (failed) warnings.push(`${failed} directive pair(s) stored as XAML vs JSON could not be normalized — they compare as raw text and will show as different.`);
-            }
-
-            this._post({ command: 'status', text: 'Computing BPM diff…' });
-            const bpmData = CompareBpm.buildBpmCompare(dA.methods, dA.directives, dB.methods, dB.directives);
+            const { bpmData, rawA, rawB } = await compareBpmData(cA, cB, profileA, profileB, text => this._post({ command: 'status', text }));
             // Stored bodies stay host-side for the "XML" diff; the webview only
             // gets canonical text.
-            this._bpmRawA = new Map(dA.directives.map(d => [CompareBpm.directiveKey(d), d.Body || '']));
-            this._bpmRawB = new Map(dB.directives.map(d => [CompareBpm.directiveKey(d), d.Body || '']));
-            bpmData.warnings = warnings;
+            this._bpmRawA = rawA;
+            this._bpmRawB = rawB;
             this._post({ command: 'bpmReady', data: bpmData });
         } catch (err) {
             this._post({ command: 'error', tab: 'bpm', message: err.message });
@@ -1116,7 +1137,7 @@ select:focus{outline:1px solid var(--vscode-focusBorder)}
     <div class="summary" id="bpmSummary"></div>
     <div class="filter-bar">
       <input class="search" id="bpmSearch" placeholder="Search services / methods / directives…" oninput="bpmApply()">
-      <select id="bpmSource" onchange="bpmApply()"><option value="">All sources</option><option value="BO">Method directives</option><option value="DB">Data directives</option></select>
+      <select id="bpmSource" onchange="bpmApply()"><option value="">All sources</option><option value="BO">Method directives</option><option value="DB">Data directives</option><option value="DQ">UBAQ directives</option></select>
       <label class="fb-chk"><input type="checkbox" id="bpmHideDisabled" onchange="bpmApply()"> Hide disabled</label>
       <label class="fb-chk"><input type="checkbox" id="bpmCodeOnly" onchange="bpmApply()"> Code changes only</label>
     </div>
@@ -1808,3 +1829,5 @@ ${COMPARE_WEBVIEW_JS}
 ComparePanel.KEY = 'efxCompare';
 ComparePanel.panels = new Map();
 exports.ComparePanel = ComparePanel;
+exports.compareFunctionsData = compareFunctionsData;
+exports.compareBpmData = compareBpmData;
