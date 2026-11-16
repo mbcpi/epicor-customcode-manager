@@ -281,6 +281,9 @@ BPM directive code follows the same pattern under `.efx/bpm/{BpMethodCode}/{Dire
 
 ## Changelog
 
+### 1.0.1
+- **Claude MCP:** `.mcpb` server now starts when Claude Desktop launches it (the `require.main` check failed under Desktop's Node, so the server never connected)
+
 ### 1.0.0
 - **Claude MCP server** (`mcp/`, shipped as a one-click `.mcpb` for Claude Desktop): list, search, pull, compare, push functions and BPM directives, create/delete functions, references, signatures, execute, profiles, promote/demote — all through the extension, gated per profile by *Claude access* (off / read / write / risky). See *Using with Claude*.
 - **Batch push:** several functions in one library save in one compile (needs the 1.0.0 `ApplyChangesWithDiagnostics` code)

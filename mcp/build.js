@@ -32,6 +32,7 @@ require("esbuild").buildSync({
     logLevel: "warning",
 });
 
+process.env.EFX_MCP_NO_AUTOSTART = "1"; // require() only to read TOOLS — don't start the stdio server
 const { TOOLS } = require("./server.js");
 const manifest = {
     manifest_version: "0.3",

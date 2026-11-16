@@ -270,7 +270,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     }
 });
 
-if (require.main === module) {
+if (require.main === module || process.env.EFX_MCP_NO_AUTOSTART !== "1") {
     server.connect(new StdioServerTransport()).catch(e => {
         console.error("efx-mcp failed to start:", e);
         process.exit(1);
