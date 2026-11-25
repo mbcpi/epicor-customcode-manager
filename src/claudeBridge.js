@@ -24,10 +24,16 @@ const REQ_RE = /^([A-Za-z0-9-]{8,64})\.json$/;
 const LEVELS = ["off", "read", "write", "risky"];
 const MAX_AGE_MS = 10 * 60 * 1000;
 const CLIENT_WAIT_MS = 20 * 1000;
+// Requests already in the folder when we start watching it are held this long.
+// A cold start (MCP wrote the request, then opened the vscode:// link) claims
+// its request via the link inside the MCP's 30s ack wait; anything still held
+// after that is a leftover from before VS Code started and is deleted unrun.
+const LEFTOVER_HOLD_MS = 35 * 1000;
 const BRIDGE_DIR = path.join(os.homedir(), ".efx-manager");
 const BRIDGE_FILE = path.join(BRIDGE_DIR, "bridge.json");
 const REQUEST_DIR = "_claude";
-const EXTENSION_ID = "micah-bragg.epicor-efx-manager";
+const EXTENSION_ID = "cpi.epicor-efx-manager"; // fallback; the live id comes from context.extension
+const auth = require("./auth");
 
 function levelOf(profile) {
     const v = profile && profile.claudeAccess;
@@ -60,6 +66,7 @@ class ClaudeBridge {
         this.watcher = null;
         this.watchedDir = null;
         this.sweepTimer = null;
+        this.held = new Map(); // id -> dir, leftovers waiting on a vscode:// claim
     }
 
     start() {
@@ -90,6 +97,7 @@ class ClaudeBridge {
             serverUrl: p.serverUrl || "",
             companies: p.companies || [],
             claudeAccess: levelOf(p),
+            authType: p.authType === "entra" ? "entra" : "basic",
             root: this.api.profileRootNoPrompt(p.name),
         }));
         fs.mkdirSync(BRIDGE_DIR, { recursive: true });
@@ -98,7 +106,7 @@ class ClaudeBridge {
             pid: process.pid,
             appName: vscode.env.appName,
             uriScheme: vscode.env.uriScheme,
-            extensionId: EXTENSION_ID,
+            extensionId: (this.context.extension && this.context.extension.id) || EXTENSION_ID,
             activeProfile: active || null,
             activeCompany: this.api.getActiveCompany() || null,
             requestDir: active ? this.requestDir(active) : null,
@@ -124,6 +132,7 @@ class ClaudeBridge {
         if (!dir) return;
         try { fs.mkdirSync(dir, { recursive: true }); } catch { return; }
         this.watchedDir = dir;
+        this.holdLeftovers(dir);
         try {
             this.watcher = fs.watch(dir, (_evt, name) => {
                 const m = name && String(name).match(REQ_RE);
@@ -147,7 +156,35 @@ class ClaudeBridge {
         }
     }
 
+    holdLeftovers(dir) {
+        let names = [];
+        try { names = fs.readdirSync(dir); } catch { return; }
+        const ids = names.map(n => (n.match(REQ_RE) || [])[1]).filter(Boolean);
+        if (!ids.length) return;
+        for (const id of ids) this.held.set(id, dir);
+        setTimeout(() => this.discardHeld(dir), LEFTOVER_HOLD_MS);
+    }
+
+    discardHeld(dir) {
+        let n = 0;
+        for (const [id, d] of this.held) {
+            if (d !== dir) continue;
+            this.held.delete(id);
+            const reqFile = path.join(dir, `${id}.json`);
+            const claimed = path.join(dir, `${id}.discarded-${process.pid}`);
+            try { fs.renameSync(reqFile, claimed); } catch { continue; } // already gone (claimed, or the MCP gave up)
+            try { fs.unlinkSync(claimed); n++; } catch { /* ignore */ }
+        }
+        if (n) {
+            console.log(`EFx Claude bridge: discarded ${n} leftover request(s) in ${dir}`);
+            vscode.window.setStatusBarMessage(`EFx: discarded ${n} stale Claude request${n === 1 ? "" : "s"} from before VS Code started`, 8000);
+        }
+    }
+
+    // One URI handler per extension: /request is the MCP bridge, /auth is the
+    // Entra sign-in redirect (auth.js).
     handleUri(uri) {
+        if (uri.path === "/auth") return auth.handleRedirect(uri);
         if (uri.path !== "/request") return;
         const id = new URLSearchParams(uri.query).get("id") || "";
         if (!ID_RE.test(id)) {
@@ -155,13 +192,15 @@ class ClaudeBridge {
             return;
         }
         // Make sure the watcher is pointed at the active profile, then try the id.
+        // The link is what releases a held (cold-start) request.
         this.watchActiveDir();
+        this.held.delete(id);
         this.enqueue(id);
     }
 
     // One request at a time — ops can switch profiles or hit Epicor heavily.
     enqueue(id) {
-        if (this.inFlight.has(id)) return;
+        if (this.inFlight.has(id) || this.held.has(id)) return;
         this.inFlight.add(id);
         this.queue = this.queue
             .then(() => this.process(id))

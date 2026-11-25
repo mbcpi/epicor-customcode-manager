@@ -51,7 +51,10 @@ const manifest = {
     },
     tools: [
         { name: "list_profiles", description: "Profiles configured in the EFx extension and their Claude access level." },
-        ...TOOLS.map(t => ({ name: t.name, description: t.description.replace(/\s*\[needs Claude access: \w+\]$/, "") })),
+        { name: "check_update", description: "Check GitHub Releases for a newer EFx MCP server." },
+        { name: "install_update", description: "Download the newest EFx MCP .mcpb and open it so Claude Desktop can install it." },
+        ...TOOLS.filter(t => !(t.meta && t.meta.ui && t.meta.ui.visibility && !t.meta.ui.visibility.includes("model")))
+            .map(t => ({ name: t.name, description: t.description.replace(/\s*\[needs Claude access: \w+\]$/, "") })),
     ],
     tools_generated: false,
     compatibility: { platforms: ["darwin", "win32", "linux"], runtimes: { node: ">=18.0.0" } },

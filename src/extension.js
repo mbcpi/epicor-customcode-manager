@@ -39,6 +39,7 @@ const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const epicorClient_1 = require("./epicorClient");
+const auth_1 = require("./auth");
 const treeProvider_1 = require("./treeProvider");
 const executePanel_1 = require("./executePanel");
 const bpmClient_1 = require("./bpmClient");
@@ -52,6 +53,7 @@ const kineticLayerClient_1 = require("./kineticLayerClient");
 const { ComparePanel } = require("./comparePanel");
 const { openFunctionSearch, clearSearchCache } = require("./searchQuickPick");
 const { ClaudeBridge } = require("./claudeBridge");
+const { ProfilePanel } = require("./profilePanel");
 const claudeOps_1 = require("./claudeOps");
 // Store pulled tablesets for push-back/debugging.
 const pulledTablesets = new Map();
@@ -525,7 +527,30 @@ function formatBOUpdErrors(errors) {
         return `${index + 1}. ${level}${type}${table}\n${text}`;
     }).join("\n\n");
 }
+const OLD_EXTENSION_ID = "micah-bragg.epicor-efx-manager";
 function activate(context) {
+    // 1.0.8 moved the publisher (micah-bragg → cpi). An old copy left installed
+    // registers the same commands and views, so don't start next to it.
+    if (vscode.extensions.getExtension(OLD_EXTENSION_ID)) {
+        vscode.window.showWarningMessage(
+            "EFx Manager has a new publisher. Uninstall the old copy to finish updating — profiles carry over; passwords and API keys need re-entering once.",
+            { modal: false },
+            "Uninstall old copy"
+        ).then(async (choice) => {
+            if (choice !== "Uninstall old copy") return;
+            try {
+                await vscode.commands.executeCommand("workbench.extensions.uninstallExtension", OLD_EXTENSION_ID);
+            }
+            catch (e) {
+                vscode.window.showErrorMessage(`EFx: Couldn't uninstall the old copy (${e.message}). Remove "${OLD_EXTENSION_ID}" from the Extensions view.`);
+                return;
+            }
+            const r = await vscode.window.showInformationMessage("EFx: Old copy removed. Reload to finish.", "Reload");
+            if (r === "Reload") vscode.commands.executeCommand("workbench.action.reloadWindow");
+        });
+        return;
+    }
+    auth_1.init(context);
     extensionContext = context;
     treeProvider = new treeProvider_1.EfxTreeProvider(null);
     efxLibrariesView = vscode.window.createTreeView("efxLibraries", { treeDataProvider: treeProvider });
@@ -550,6 +575,45 @@ function activate(context) {
         await openProfileManager(context);
     };
     context.subscriptions.push(vscode.commands.registerCommand("efx.manageProfiles", manageProfilesHandler));
+    // -- Sign In (Entra profiles). The only interactive Microsoft sign-in. --
+    context.subscriptions.push(vscode.commands.registerCommand("efx.signIn", async (profileName) => {
+        const name = typeof profileName === "string" && profileName ? profileName : getActiveProfileName();
+        const profile = getProfiles().find(p => p.name === name);
+        if (!profile) {
+            vscode.window.showWarningMessage("EFx: No active profile to sign in to.");
+            return false;
+        }
+        try {
+            const account = await auth_1.signIn(profile);
+            vscode.window.showInformationMessage(`EFx: Signed in to "${name}" as ${account}.`);
+            if (name === getActiveProfileName()) await activateProfile(context, name);
+            return true;
+        }
+        catch (e) {
+            vscode.window.showErrorMessage(`EFx: Sign-in for "${name}" failed — ${e.message}`);
+            return false;
+        }
+    }));
+    // -- Sign Out (Entra profiles): forget the stored sign-in on this machine. --
+    context.subscriptions.push(vscode.commands.registerCommand("efx.signOut", async (profileName) => {
+        const name = typeof profileName === "string" && profileName ? profileName : getActiveProfileName();
+        const profile = getProfiles().find(p => p.name === name);
+        if (!profile || auth_1.authTypeOf(profile) !== "entra") {
+            vscode.window.showInformationMessage(`EFx: "${name || "(none)"}" isn't an Entra profile — nothing to sign out of.`);
+            return;
+        }
+        try {
+            await auth_1.signOut(profile);
+            vscode.window.showInformationMessage(`EFx: Signed out of "${name}".`);
+        }
+        catch (e) {
+            vscode.window.showErrorMessage(`EFx: Sign-out failed — ${e.message}`);
+        }
+    }));
+    // -- Profile Settings panel for the active profile (or a new one if none) --
+    context.subscriptions.push(vscode.commands.registerCommand("efx.profileSettings", () => {
+        openProfilePanel(context, getActiveProfileName() || null);
+    }));
     // Keep configureConnection as alias for backwards compat / discoverability
     context.subscriptions.push(vscode.commands.registerCommand("efx.configureConnection", manageProfilesHandler));
     // -- Switch Profile --
@@ -2296,19 +2360,12 @@ function activate(context) {
         }
         if (!company) return null;
 
-        const pwd = await context.secrets.get(profileSecretKey(pick.profile.name, "password"));
-        if (!pwd) {
-            vscode.window.showErrorMessage(`EFx: No password stored for "${pick.profile.name}".`);
+        const authProblem = await auth_1.preflight(pick.profile);
+        if (authProblem) {
+            vscode.window.showErrorMessage(`EFx: ${authProblem}`);
             return null;
         }
-        const apiKey = (await context.secrets.get(profileSecretKey(pick.profile.name, "apiKey"))) || "";
-        return new kineticLayerClient_1.KineticMetaFXClient({
-            serverUrl: pick.profile.serverUrl,
-            company,
-            username: pick.profile.username,
-            password: pwd,
-            apiKey,
-        });
+        return new kineticLayerClient_1.KineticMetaFXClient(auth_1.clientConfig(pick.profile, company));
     }
 
     // ── Kinetic App Commands (stashed — uncomment to re-enable) ──────────────
@@ -2586,7 +2643,9 @@ function activate(context) {
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Settings:
-//   efx.profiles        — array of { name, serverUrl, username, companies[] }
+//   efx.profiles        — array of { name, serverUrl, username, companies[],
+//                          authType?: "basic" | "entra" (missing = basic),
+//                          clientId?, tenantId?, scope? (entra only, not secrets) }
 //   efx.activeProfile   — name of current profile
 //   efx.activeCompany   — currently selected company within active profile
 //
@@ -2626,6 +2685,20 @@ function getActiveProfile() {
 function profileSecretKey(profileName, kind) {
     return `efx.profile.${profileName}.${kind}`;
 }
+// Profiles saved before authType existed have none — they're basic. No migration.
+const authTypeOf = auth_1.authTypeOf;
+// Tabbed settings panel (General / Authentication / Integrations). null = new profile.
+function openProfilePanel(context, profileName) {
+    ProfilePanel.open(context, {
+        getProfiles, setProfiles, getActiveProfileName, setActiveProfileName,
+        getActiveCompany, setActiveCompany,
+        activateProfile: name => activateProfile(context, name),
+        profileSecretKey, profileRootNoPrompt, authTypeOf,
+        CLAUDE_ACCESS_LEVELS,
+        EpicorClient: epicorClient_1.EpicorClient,
+        auth: auth_1,
+    }, profileName);
+}
 // Updates the inline description shown next to "EFx Libraries" / "BPM Methods"
 // in the view title bar. Format: "Profile / Company". Empty when no active profile.
 function updateViewDescriptions() {
@@ -2658,9 +2731,10 @@ async function openProfileManager(context) {
         });
     }
     if (profiles.length > 0) {
-        items.push({ label: "$(edit) Edit Profile…", action: "edit" });
+        items.push({ label: "$(settings-gear) Profile Settings…", description: "Edit any profile in the settings panel", action: "edit" });
         items.push({ label: "$(trash) Delete Profile…", action: "delete" });
     }
+    items.push({ label: "$(history) Classic wizard…", description: "Old step-by-step editor (fallback)", action: "classic" });
     const pick = await vscode.window.showQuickPick(items, {
         placeHolder: profiles.length === 0
             ? "No profiles yet — create your first one"
@@ -2669,18 +2743,27 @@ async function openProfileManager(context) {
     });
     if (!pick) return;
     if (pick.action === "new") {
-        await createProfile(context);
+        openProfilePanel(context, null);
     }
     else if (pick.action === "use") {
         await activateProfile(context, pick.profileName);
     }
     else if (pick.action === "edit") {
-        const target = await pickProfile("Select profile to edit");
-        if (target) await editProfile(context, target);
+        // Panel has its own profile picker — open on the active one.
+        openProfilePanel(context, activeName || profiles[0].name);
     }
     else if (pick.action === "delete") {
         const target = await pickProfile("Select profile to delete");
         if (target) await deleteProfile(context, target);
+    }
+    else if (pick.action === "classic") {
+        const target = await vscode.window.showQuickPick(
+            [{ label: "$(add) New profile", name: null }, ...profiles.map(p => ({ label: p.name, name: p.name }))],
+            { placeHolder: "Classic wizard — new or edit", ignoreFocusOut: true }
+        );
+        if (!target) return;
+        if (target.name) await editProfile(context, target.name);
+        else await createProfile(context);
     }
 }
 
@@ -2816,10 +2899,15 @@ async function runProfileEditor(context, draft, isNew) {
     if (serverUrl === undefined) return false;
     draft.serverUrl = serverUrl.trim();
 
-    // Step 3: username
+    // Step 2b: auth type (+ Entra app details)
+    if (!(await promptAuthFields(draft))) return false;
+    const isBasic = authTypeOf(draft) === "basic";
+
+    // Step 3: username. Entra profiles still need the Epicor user ID for
+    // UserFile company discovery and the layer preview session.
     const username = await vscode.window.showInputBox({
         ...PROFILE_INPUT_OPTS,
-        prompt: "Username",
+        prompt: isBasic ? "Username" : "Epicor user ID (sign-in itself goes through Entra)",
         value: draft.username,
         validateInput: (v) => (!v || !v.trim()) ? "Username is required" : null,
     });
@@ -2829,11 +2917,12 @@ async function runProfileEditor(context, draft, isNew) {
     // Step 4: password — only prompt for new profiles, or if user opts in for edits.
     // Track the resolved password locally so we can use it for company discovery
     // without an extra SecretStorage round-trip.
-    let resolvedPassword = isNew
+    // Entra profiles have no password — skip the step entirely.
+    let resolvedPassword = (isNew || !isBasic)
         ? null
         : await context.secrets.get(profileSecretKey(draft.name, "password"));
-    let promptForPassword = isNew;
-    if (!isNew) {
+    let promptForPassword = isNew && isBasic;
+    if (!isNew && isBasic) {
         const pwdChoice = await vscode.window.showQuickPick(
             [
                 { label: "Keep existing password", value: false },
@@ -2928,6 +3017,63 @@ async function runProfileEditor(context, draft, isNew) {
     if (accessPick === undefined) return false;
     draft.claudeAccess = accessPick.value;
 
+    return true;
+}
+// Asks basic vs entra; for entra also clientId / tenantId / scope. None of these
+// are secrets, so they live on the profile in settings. Switching back to basic
+// drops the Entra fields. Returns false on cancel.
+async function promptAuthFields(draft) {
+    const current = authTypeOf(draft);
+    const pick = await vscode.window.showQuickPick(
+        [
+            { label: "Basic — username + password", description: current === "basic" ? "current" : "", value: "basic" },
+            { label: "Entra SSO — Microsoft sign-in (cloud)", description: current === "entra" ? "current" : "", value: "entra" },
+        ],
+        { placeHolder: "Authentication", ignoreFocusOut: true }
+    );
+    if (!pick) return false;
+    draft.authType = pick.value;
+    if (pick.value === "basic") {
+        delete draft.clientId;
+        delete draft.tenantId;
+        delete draft.scope;
+        return true;
+    }
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const DOMAIN_RE = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+    const clientId = await vscode.window.showInputBox({
+        ...PROFILE_INPUT_OPTS,
+        prompt: "Entra client ID — the Kinetic native app registration",
+        value: draft.clientId || "",
+        validateInput: (v) => GUID_RE.test((v || "").trim()) ? null : "Client ID must be a GUID",
+    });
+    if (clientId === undefined) return false;
+    const tenantId = await vscode.window.showInputBox({
+        ...PROFILE_INPUT_OPTS,
+        prompt: "Entra tenant ID (GUID) or domain",
+        value: draft.tenantId || "",
+        validateInput: (v) => {
+            const t = (v || "").trim();
+            return (GUID_RE.test(t) || DOMAIN_RE.test(t)) ? null : "Tenant must be a GUID or a domain";
+        },
+    });
+    if (tenantId === undefined) return false;
+    const scope = await vscode.window.showInputBox({
+        ...PROFILE_INPUT_OPTS,
+        prompt: "API scope",
+        placeHolder: "api://<webAppId>/<scopeName>",
+        value: draft.scope || "",
+        validateInput: (v) => {
+            const s = (v || "").trim();
+            if (!s) return "Scope is required";
+            if (/\s/.test(s)) return "One scope, no spaces";
+            return null;
+        },
+    });
+    if (scope === undefined) return false;
+    draft.clientId = clientId.trim();
+    draft.tenantId = tenantId.trim();
+    draft.scope = scope.trim();
     return true;
 }
 const CLAUDE_ACCESS_LEVELS = [
@@ -3025,13 +3171,13 @@ async function fetchCompaniesFlow(draft, password, apiKey) {
         fetched = await vscode.window.withProgress(
             { location: vscode.ProgressLocation.Notification, title: `Fetching companies for ${draft.username}...` },
             async () => {
-                const tempClient = new epicorClient_1.EpicorClient({
+                const tempClient = new epicorClient_1.EpicorClient(auth_1.draftBasicConfig({
                     serverUrl: draft.serverUrl,
                     company: seed,
                     username: draft.username,
                     password,
-                    apiKey: apiKey || "",
-                });
+                    apiKey,
+                }));
                 return await tempClient.getUserCompanies();
             }
         );
@@ -3104,12 +3250,11 @@ async function activateProfile(context, profileName) {
         vscode.window.showErrorMessage(`EFx: Profile "${profileName}" not found.`);
         return;
     }
-    const password = await context.secrets.get(profileSecretKey(profileName, "password"));
-    if (!password) {
-        vscode.window.showErrorMessage(`EFx: No password stored for "${profileName}". Edit the profile to set one.`);
+    const authProblem = await auth_1.preflight(profile);
+    if (authProblem) {
+        vscode.window.showErrorMessage(`EFx: ${authProblem}`);
         return;
     }
-    const apiKey = (await context.secrets.get(profileSecretKey(profileName, "apiKey"))) || "";
     // Pick company: keep current if still valid for this profile, else first
     let activeCompany = getActiveCompany();
     if (!profile.companies.includes(activeCompany)) {
@@ -3117,13 +3262,7 @@ async function activateProfile(context, profileName) {
     }
     await setActiveProfileName(profileName);
     await setActiveCompany(activeCompany);
-    client = new epicorClient_1.EpicorClient({
-        serverUrl: profile.serverUrl,
-        company: activeCompany,
-        username: profile.username,
-        password,
-        apiKey,
-    });
+    client = new epicorClient_1.EpicorClient(auth_1.clientConfig(profile, activeCompany));
     treeProvider.setClient(client);
     bpmClientInst = new bpmClient_1.BpmClient(client);
     bpmTreeProvider.setClient(bpmClientInst);
@@ -3193,20 +3332,13 @@ async function applyActiveCompany(context, company) {
         vscode.window.showErrorMessage(`EFx: "${company}" is not in profile "${profile.name}".`);
         return;
     }
-    const password = await context.secrets.get(profileSecretKey(profile.name, "password"));
-    if (!password) {
-        vscode.window.showErrorMessage(`EFx: No password stored for "${profile.name}".`);
+    const authProblem = await auth_1.preflight(profile);
+    if (authProblem) {
+        vscode.window.showErrorMessage(`EFx: ${authProblem}`);
         return;
     }
-    const apiKey = (await context.secrets.get(profileSecretKey(profile.name, "apiKey"))) || "";
     await setActiveCompany(company);
-    client = new epicorClient_1.EpicorClient({
-        serverUrl: profile.serverUrl,
-        company,
-        username: profile.username,
-        password,
-        apiKey,
-    });
+    client = new epicorClient_1.EpicorClient(auth_1.clientConfig(profile, company));
     treeProvider.setClient(client);
     bpmClientInst = new bpmClient_1.BpmClient(client);
     bpmTreeProvider.setClient(bpmClientInst);
@@ -3422,11 +3554,9 @@ async function initClient(context) {
     if (!profile) {
         return;
     }
-    const password = await context.secrets.get(profileSecretKey(profileName, "password"));
-    if (!password) {
+    if (await auth_1.preflight(profile)) {
         return;
     }
-    const apiKey = (await context.secrets.get(profileSecretKey(profileName, "apiKey"))) || "";
     let activeCompany = getActiveCompany();
     if (!profile.companies.includes(activeCompany)) {
         activeCompany = profile.companies[0] || "";
@@ -3438,13 +3568,7 @@ async function initClient(context) {
     if (activeCompany !== getActiveCompany()) {
         await setActiveCompany(activeCompany);
     }
-    client = new epicorClient_1.EpicorClient({
-        serverUrl: profile.serverUrl,
-        company: activeCompany,
-        username: profile.username,
-        password,
-        apiKey,
-    });
+    client = new epicorClient_1.EpicorClient(auth_1.clientConfig(profile, activeCompany));
     treeProvider.setClient(client);
     bpmClientInst = new bpmClient_1.BpmClient(client);
     bpmTreeProvider.setClient(bpmClientInst);

@@ -28,7 +28,7 @@ const os = __importStar(require("os"));
 // ─────────────────────────────────────────────────────────────────────────────
 const GITHUB_OWNER     = 'mbcpi';
 const GITHUB_REPO      = 'epicor-customcode-manager';
-const EXTENSION_PUBLISHER = 'micah-bragg';
+const EXTENSION_PUBLISHER = 'cpi';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RELEASES_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;

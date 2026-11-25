@@ -193,7 +193,7 @@ The `mcp/` folder holds an MCP server that lets Claude (Claude Desktop, and Cowo
 ### How a request travels
 
 1. Claude calls a tool. The MCP server writes `<profile folder>/_claude/<id>.json`.
-2. If VS Code is running, the extension's file watcher picks it up. If not, the MCP server opens `vscode://micah-bragg.epicor-efx-manager/request?id=<id>`, which starts VS Code and the extension.
+2. If VS Code is running, the extension's file watcher picks it up. If not, the MCP server opens `vscode://cpi.epicor-efx-manager/request?id=<id>`, which starts VS Code and the extension.
 3. The extension claims the request (atomic rename, so only one window runs it), writes `<id>.ack.json`, runs it and writes `<id>.result.json`.
 4. The MCP server returns the result and deletes the request files.
 

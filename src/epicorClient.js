@@ -36,22 +36,17 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.EpicorClient = void 0;
 const https = __importStar(require("https"));
 const http = __importStar(require("http"));
+const { withAuthRetry } = require("./authRetry");
 
 class EpicorClient {
     constructor(config) {
         this.config = config;
     }
 
-    getHeaders() {
-        const auth = Buffer.from(`${this.config.username}:${this.config.password}`).toString('base64');
-        const headers = {
-            'Content-Type': 'application/json',
-            'Authorization': `Basic ${auth}`,
-        };
-        if (this.config.apiKey) {
-            headers['x-api-key'] = this.config.apiKey;
-        }
-        return headers;
+    // Auth headers come from config.authHeaders (auth.js getAuthHeader):
+    // Basic or Bearer, plus x-api-key. A 401 on an Entra profile retries once.
+    _send(send) {
+        return withAuthRetry(this.config, auth => send({ 'Content-Type': 'application/json', ...auth }));
     }
 
     getDesignerUrl(method) {
@@ -80,6 +75,10 @@ class EpicorClient {
 
     // GET request — used for OData entity endpoints that don't accept POST.
     async requestGet(url) {
+        return this._send(headers => this._requestGetWith(url, headers));
+    }
+
+    _requestGetWith(url, headers) {
         return new Promise((resolve, reject) => {
             const parsed = new URL(url);
             const isHttps = parsed.protocol === 'https:';
@@ -89,7 +88,7 @@ class EpicorClient {
                 port: parsed.port || (isHttps ? 443 : 80),
                 path: parsed.pathname + parsed.search,
                 method: 'GET',
-                headers: this.getHeaders(),
+                headers,
                 rejectUnauthorized: false,
             };
 
@@ -114,7 +113,7 @@ class EpicorClient {
                         catch {
                             errorMsg = data || errorMsg;
                         }
-                        reject(new Error(errorMsg));
+                        reject(Object.assign(new Error(errorMsg), { status: res.statusCode }));
                     }
                 });
             });
@@ -136,6 +135,10 @@ class EpicorClient {
     }
 
     async requestRaw(url, bodyStr) {
+        return this._send(headers => this._requestRawWith(url, bodyStr, headers));
+    }
+
+    _requestRawWith(url, bodyStr, headers) {
         return new Promise((resolve, reject) => {
             const parsed = new URL(url);
             const isHttps = parsed.protocol === 'https:';
@@ -146,7 +149,7 @@ class EpicorClient {
                 path: parsed.pathname + parsed.search,
                 method: 'POST',
                 headers: {
-                    ...this.getHeaders(),
+                    ...headers,
                     'Content-Length': Buffer.byteLength(bodyStr),
                 },
                 rejectUnauthorized: false,
@@ -173,7 +176,7 @@ class EpicorClient {
                         console.error("EFx HTTP failure status:", res.statusCode);
                         console.error("EFx HTTP failure body:", data);
 
-                        reject(new Error(errorMsg));
+                        reject(Object.assign(new Error(errorMsg), { status: res.statusCode }));
                     }
                 });
             });

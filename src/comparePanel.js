@@ -11,6 +11,7 @@ const COMPARE_WEBVIEW_JS = require("./compareWebview.txt");
 const { directiveToCanonicalText } = require("./widgetXaml");
 const { describeBody, normalizeCode } = require("./efxBody");
 const { KineticMetaFXClient } = require("./kineticLayerClient");
+const auth = require("./auth");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FUNCTIONS COMPARE HELPERS  (ported from compare.py)
@@ -327,31 +328,23 @@ class ComparePanel {
         this._post({ command: 'profiles', data: profiles.map(p => ({ name: p.name, companies: p.companies || [] })), activeProfile, activeCompany });
     }
 
-    async _secrets(profileName) {
-        const password = (await this.context.secrets.get(`efx.profile.${profileName}.password`)) || '';
-        const apiKey   = (await this.context.secrets.get(`efx.profile.${profileName}.apiKey`))   || '';
-        // Fail loudly rather than building a client with an empty password and
-        // surfacing a raw auth error later (matches pickKineticEnv elsewhere).
-        if (!password) {
-            throw new Error(`No password stored for profile "${profileName}" — open Manage Profiles and re-enter it.`);
-        }
-        return { password, apiKey };
+    // Client config for a profile, via auth.js. Fails loudly on a missing
+    // Basic password instead of surfacing a raw 401 later.
+    async _config(profileName, company) {
+        const profiles = vscode.workspace.getConfiguration().get('efx.profiles') || [];
+        const profile  = profiles.find(p => p.name === profileName);
+        if (!profile) throw new Error(`Profile "${profileName}" not found`);
+        const problem = await auth.preflight(profile);
+        if (problem) throw new Error(problem);
+        return auth.clientConfig(profile, company);
     }
 
     async _efxClient(profileName, company) {
-        const profiles = vscode.workspace.getConfiguration().get('efx.profiles') || [];
-        const profile  = profiles.find(p => p.name === profileName);
-        if (!profile) throw new Error(`Profile "${profileName}" not found`);
-        const { password, apiKey } = await this._secrets(profileName);
-        return new EpicorClient({ serverUrl: profile.serverUrl, company, username: profile.username, password, apiKey });
+        return new EpicorClient(await this._config(profileName, company));
     }
 
     async _metafxClient(profileName, company) {
-        const profiles = vscode.workspace.getConfiguration().get('efx.profiles') || [];
-        const profile  = profiles.find(p => p.name === profileName);
-        if (!profile) throw new Error(`Profile "${profileName}" not found`);
-        const { password, apiKey } = await this._secrets(profileName);
-        return new KineticMetaFXClient({ serverUrl: profile.serverUrl, company, username: profile.username, password, apiKey });
+        return new KineticMetaFXClient(await this._config(profileName, company));
     }
 
     async _runFunctionsCompare({ profileA, companyA, profileB, companyB }) {

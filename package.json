@@ -2,14 +2,14 @@
 	"name": "epicor-efx-manager",
 	"displayName": "Epicor EFx Manager",
 	"description": "Pull, edit, push, and execute Epicor Kinetic EFx Functions from VS Code",
-	"version": "1.0.1",
+	"version": "1.0.8",
 	"license": "MIT",
 	"icon": "images/icon.png",
 	"galleryBanner": {
 		"color": "#000000",
 		"theme": "dark"
 	},
-	"publisher": "micah-bragg",
+	"publisher": "cpi",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/mbcpi/epicor-customcode-manager.git"
@@ -84,6 +84,24 @@
 				"command": "efx.manageProfiles",
 				"title": "Manage Profiles",
 				"icon": "$(gear)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.profileSettings",
+				"title": "Profile Settings",
+				"icon": "$(settings-gear)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.signIn",
+				"title": "Sign In",
+				"icon": "$(account)",
+				"category": "EFx"
+			},
+			{
+				"command": "efx.signOut",
+				"title": "Sign Out",
+				"icon": "$(sign-out)",
 				"category": "EFx"
 			},
 			{
@@ -510,6 +528,28 @@
 								"enum": ["off", "read", "write", "risky"],
 								"default": "off",
 								"description": "What Claude may do through the EFx MCP server while this profile is active. Set via EFx: Manage Profiles → Edit Profile; Claude can never change it."
+							},
+							"authType": {
+								"type": "string",
+								"enum": ["basic", "entra"],
+								"default": "basic",
+								"description": "basic = username + password (on-prem). entra = Microsoft Entra SSO through VS Code's Microsoft sign-in (cloud). Missing means basic."
+							},
+							"clientId": {
+								"type": "string",
+								"description": "entra only: client ID of the Kinetic native app registration."
+							},
+							"tenantId": {
+								"type": "string",
+								"description": "entra only: Entra tenant ID (GUID) or domain."
+							},
+							"scope": {
+								"type": "string",
+								"description": "entra only: API scope, e.g. api://<webAppId>/<scopeName>."
+							},
+							"redirectUri": {
+								"type": "string",
+								"description": "entra only: https page already on the app registration (e.g. Kinetic's azuread-redirect.html) — sign-in runs in a small browser window that catches it. Empty = vscode://<extension id>/auth."
 							}
 						}
 					}
@@ -538,7 +578,8 @@
 		"deploy": "npm run compile && node scripts/deploy.js",
 		"watch": "esbuild src/extension.js --bundle --outfile=out/extension.js --external:vscode --platform=node --format=cjs --watch",
 		"package": "npx @vscode/vsce package",
-		"package:mcp": "cd mcp && npm ci && npm run build"
+		"package:mcp": "cd mcp && npm ci && npm run build",
+		"test": "node --test test/*.test.js"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",

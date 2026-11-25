@@ -13,6 +13,10 @@ const efxBody_1 = require("./efxBody");
 const { directiveToCanonicalText } = require("./widgetXaml");
 const { compareFunctionsData, compareBpmData } = require("./comparePanel");
 const { getCorpus, search } = require("./searchQuickPick");
+const { KineticMetaFXClient } = require("./kineticLayerClient");
+const layerContent = require("./layerContent");
+const kineticPreview = require("./kineticPreview");
+const auth = require("./auth");
 
 const MAX_LIST = 500;
 const PROFILE_NAME_RE = /^[A-Za-z0-9_\-. ]+$/;
@@ -204,12 +208,11 @@ function buildOps(api) {
     async function makeProfileClient(profileName, company) {
         const profile = api.getProfiles().find(p => p.name === profileName);
         if (!profile) throw new Error(`Profile "${profileName}" not found`);
-        const password = await api.context.secrets.get(api.profileSecretKey(profileName, "password"));
-        if (!password) throw new Error(`No password stored for profile "${profileName}"`);
-        const apiKey = (await api.context.secrets.get(api.profileSecretKey(profileName, "apiKey"))) || "";
+        const problem = await auth.preflight(profile);
+        if (problem) throw new Error(problem);
         const co = company || (profile.companies || [])[0];
         if (!(profile.companies || []).includes(co)) throw new Error(`Company "${co}" is not in profile "${profileName}"`);
-        return new EpicorClient({ serverUrl: profile.serverUrl, company: co, username: profile.username, password, apiKey });
+        return new EpicorClient(auth.clientConfig(profile, co));
     }
 
     async function askSecret(prompt) {
@@ -224,12 +227,17 @@ function buildOps(api) {
         level: "read", needsClient: false,
         async run(_args, ctx) {
             const p = ctx.profile;
+            const a = await auth.getAuthState(p);
             return {
                 activeProfile: p.name,
                 activeCompany: api.getActiveCompany(),
                 companies: p.companies || [],
                 serverUrl: p.serverUrl,
                 connected: !!client(),
+                authType: auth.authTypeOf(p),
+                authState: a.state,
+                ...(a.account ? { signedInAs: a.account } : {}),
+                ...(a.state === "login-required" ? { hint: "Ask the user to run EFx: Sign In in VS Code. Claude can't sign in." } : {}),
                 claudeAccess: ctx.level,
                 profileFolder: api.profileRootNoPrompt(p.name),
             };
@@ -804,6 +812,19 @@ function buildOps(api) {
         }
         if (args.autoPush !== undefined) p.autoPush = !!args.autoPush;
         if (args.autoClean !== undefined) p.autoClean = !!args.autoClean;
+        if (args.authType !== undefined) {
+            if (!["basic", "entra"].includes(args.authType)) throw new Error('authType must be "basic" or "entra"');
+            p.authType = args.authType;
+        }
+        for (const f of ["clientId", "tenantId", "scope"]) {
+            if (args[f] !== undefined) p[f] = String(args[f]).trim();
+        }
+        if (auth.authTypeOf(p) === "entra") {
+            const bad = auth.entraFieldProblem(p);
+            if (bad) throw new Error(`Entra profile: ${bad}`);
+        } else {
+            delete p.clientId; delete p.tenantId; delete p.scope;
+        }
         return p;
     }
 
@@ -816,14 +837,23 @@ function buildOps(api) {
             if (profiles.some(p => p.name === name)) throw new Error(`Profile "${name}" already exists`);
             const draft = profileFields(args, { name, serverUrl: "", username: "", companies: [], autoPush: false, autoClean: false, claudeAccess: "off" });
             if (!draft.serverUrl || !draft.username || !draft.companies.length) throw new Error("serverUrl, username and companies are required");
-            const password = await askSecret(`Claude is creating EFx profile "${name}" (${draft.serverUrl}, user ${draft.username}). Enter the Epicor password — it goes to VS Code SecretStorage, never to Claude.`);
-            if (!password) return { ok: false, summary: "cancelled — no password entered, profile not created" };
-            const apiKey = await askSecret(`API key for "${name}" (leave blank for none)`);
-            await api.context.secrets.store(api.profileSecretKey(name, "password"), password);
+            const entra = auth.authTypeOf(draft) === "entra";
+            let password = null;
+            if (!entra) {
+                password = await askSecret(`Claude is creating EFx profile "${name}" (${draft.serverUrl}, user ${draft.username}). Enter the Epicor password — it goes to VS Code SecretStorage, never to Claude.`);
+                if (!password) return { ok: false, summary: "cancelled — no password entered, profile not created" };
+            }
+            const apiKey = await askSecret(`API key for EFx profile "${name}" (leave blank for none) — it goes to VS Code SecretStorage, never to Claude.`);
+            if (password) await api.context.secrets.store(api.profileSecretKey(name, "password"), password);
             await api.context.secrets.store(api.profileSecretKey(name, "apiKey"), apiKey || "");
             profiles.push(draft);
             await api.setProfiles(profiles);
-            return { profile: { ...draft }, summary: `created profile ${name} (Claude access off until you enable it in VS Code)` };
+            return {
+                profile: { ...draft },
+                summary: entra
+                    ? `created Entra profile ${name} — the user signs in with EFx: Sign In (Claude access off until enabled in VS Code)`
+                    : `created profile ${name} (Claude access off until you enable it in VS Code)`,
+            };
         },
     };
 
@@ -846,6 +876,9 @@ function buildOps(api) {
                 }
                 next.name = newName;
             }
+            const pwKey = api.profileSecretKey(next.name, "password");
+            if (auth.authTypeOf(next) === "entra") await api.context.secrets.delete(pwKey);
+            const needsPassword = auth.authTypeOf(next) === "basic" && !(await api.context.secrets.get(pwKey));
             const wasActive = api.getActiveProfileName() === name;
             profiles[idx] = next;
             await api.setProfiles(profiles);
@@ -854,7 +887,7 @@ function buildOps(api) {
                 await api.activateProfile(newName);
             }
             const { claudeAccess, ...shown } = next;
-            return { profile: shown, summary: `updated profile ${newName}` };
+            return { profile: shown, summary: `updated profile ${newName}` + (needsPassword ? " — Basic auth has no password stored yet; use set_profile_secret" : "") };
         },
     };
 
@@ -877,12 +910,199 @@ function buildOps(api) {
         async run(args) {
             const name = str(args, "name");
             const kind = args.kind === "apiKey" ? "apiKey" : "password";
-            if (!api.getProfiles().some(p => p.name === name)) throw new Error(`Profile "${name}" not found`);
+            const target = api.getProfiles().find(p => p.name === name);
+            if (!target) throw new Error(`Profile "${name}" not found`);
+            if (kind === "password" && auth.authTypeOf(target) === "entra") {
+                throw new Error(`"${name}" uses Entra sign-in and has no password. Only kind "apiKey" can be set; the user signs in with EFx: Sign In.`);
+            }
             const value = await askSecret(`Claude asked to set the ${kind === "apiKey" ? "API key" : "password"} for EFx profile "${name}". Type it here — it never goes to Claude.`);
             if (value === undefined || (kind === "password" && !value)) return { ok: false, summary: "cancelled — nothing changed" };
             await api.context.secrets.store(api.profileSecretKey(name, kind), value);
             if (api.getActiveProfileName() === name) await api.activateProfile(name);
             return { summary: `${kind} updated for ${name}` };
+        },
+    };
+
+    // ───────────────────────────── Kinetic layers ─────────────────────────────
+    // MCP-only: pull a layer, save it as a draft, preview the draft in headless
+    // Chrome. See docs/layer-preview.md.
+
+    const SEG_RE = /^(?!\.{1,2}$)[A-Za-z0-9_.\-]+$/;
+    function segArg(args, key) {
+        const v = str(args, key);
+        if (!SEG_RE.test(v)) throw new Error(`"${key}" may only contain letters, digits, _ . -`);
+        return v;
+    }
+    function intArg(args, key, min, max, dflt) {
+        if (args[key] === undefined || args[key] === null) return dflt;
+        const n = Number(args[key]);
+        if (!Number.isInteger(n) || n < min || n > max) throw new Error(`"${key}" must be an integer from ${min} to ${max}`);
+        return n;
+    }
+    const layerFile = (app, layer) => path.join(profileRoot(), "KineticLayers", app, `${layer}.json`);
+    const relToRoot = p => path.relative(profileRoot(), p);
+
+    async function activeCfg() {
+        const name = api.getActiveProfileName();
+        const profile = api.getProfiles().find(p => p.name === name);
+        if (!profile) throw new Error(`Profile "${name}" not found`);
+        const problem = await auth.preflight(profile);
+        if (problem) throw new Error(problem);
+        return auth.clientConfig(profile, api.getActiveCompany());
+    }
+    const metafx = async () => new KineticMetaFXClient(await activeCfg());
+    const layerRowOf = async (mfx, app, layer) => layerContent.findLayerRow(await mfx.getLayers(app), layer);
+
+    ops.list_layers = {
+        level: "read",
+        async run(args) {
+            const app = segArg(args, "app");
+            const rows = await (await metafx()).getLayers(app);
+            return {
+                app, count: rows.length,
+                layers: rows.map(r => ({
+                    layer: r.LayerName || r.LayerDescription, typeCode: r.TypeCode, company: r.Company,
+                    wip: !!r.WIP, hasDraft: !!r.HasDraftContent, changedOn: r.ChangedOn, lastUpdatedBy: r.LastUpdatedBy,
+                })),
+            };
+        },
+    };
+
+    ops.get_layer = {
+        level: "read",
+        async run(args) {
+            const app = segArg(args, "app");
+            const layer = segArg(args, "layer");
+            const mfx = await metafx();
+            const row = await layerRowOf(mfx, app, layer);
+            if (!row) throw new Error(`Layer ${layer} not found on ${app} — list_layers shows what exists`);
+            const info = await mfx.getApplicationInfo(app).catch(() => null);
+            const file = layerContent.toLayerFile(await mfx.getAppForLayer(app, layer), {
+                app, layer, subType: info && info.SubType, serverChangedOn: row.ChangedOn,
+            });
+            const dest = layerFile(app, layer);
+            const c = file.content;
+            const stats = {
+                components: (c.layout.components || []).length, events: c.events.length,
+                dataviews: c.dataviews.length, pages: c.pages.length,
+            };
+            if (fs.existsSync(dest) && !args.overwrite) {
+                const local = JSON.parse(fs.readFileSync(dest, "utf-8"));
+                if (JSON.stringify(local.content) !== JSON.stringify(c)) {
+                    return { summary: `kept local ${relToRoot(dest)} — it differs from the server; pass overwrite to replace it`, file: relToRoot(dest), kept: true, ...stats };
+                }
+            }
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.writeFileSync(dest, JSON.stringify(file, null, 2), "utf-8");
+            return { summary: `pulled ${app} / ${layer}`, file: relToRoot(dest), subType: file.subType, changedOn: row.ChangedOn, ...stats };
+        },
+    };
+
+    ops.save_layer = {
+        level: "write",
+        async run(args, ctx) {
+            const app = segArg(args, "app");
+            const layer = segArg(args, "layer");
+            const src = layerFile(app, layer);
+            if (!fs.existsSync(src)) throw new Error(`No local ${relToRoot(src)} — get_layer first`);
+            const file = JSON.parse(fs.readFileSync(src, "utf-8"));
+            if (file.app !== app || file.layer !== layer) throw new Error(`${relToRoot(src)} is for ${file.app} / ${file.layer}, not ${app} / ${layer}`);
+            const mfx = await metafx();
+            const row = await layerRowOf(mfx, app, layer);
+            if (!row) throw new Error(`Layer ${layer} not found on ${app}`);
+            // ChangedOn is date-only on Epicor's side, so this only catches changes on another day.
+            if (!args.force && file.serverChangedOn && row.ChangedOn && file.serverChangedOn !== row.ChangedOn) {
+                throw new Error(`${layer} changed on the server since it was pulled (${file.serverChangedOn} → ${row.ChangedOn}). get_layer again, or pass force.`);
+            }
+            const request = layerContent.toSaveRequest(file, row);
+            const current = await mfx.getAppForLayer(app, layer);
+            fs.writeFileSync(backupPath(ctx, "KineticLayers", app, `${layer}.json`), JSON.stringify(current, null, 2), "utf-8");
+            await mfx.saveAppRequest(request);
+            const after = await layerRowOf(mfx, app, layer);
+            file.serverChangedOn = (after && after.ChangedOn) || file.serverChangedOn;
+            fs.writeFileSync(src, JSON.stringify(file, null, 2), "utf-8");
+            return { summary: `saved ${app} / ${layer} as a draft`, changedOn: file.serverChangedOn };
+        },
+    };
+
+    let previewDisposeHooked = false;
+    function previewSetup() {
+        if (!previewDisposeHooked) {
+            api.context.subscriptions.push({ dispose: () => { kineticPreview.closeBrowser(); } });
+            previewDisposeHooked = true;
+        }
+        const profileDir = String(api.getActiveProfileName()).replace(/[^A-Za-z0-9_.-]/g, "_");
+        return path.join(api.context.globalStorageUri.fsPath, "kinetic-preview", profileDir);
+    }
+
+    ops.preview_layer = {
+        level: "read", needsClient: false,
+        async run(args) {
+            const app = segArg(args, "app");
+            const layer = segArg(args, "layer");
+            const site = args.site ? segArg(args, "site") : undefined;
+            const width = intArg(args, "width", 600, 2560, 1440);
+            const height = intArg(args, "height", 400, 1600, 900);
+            const cfg = await activeCfg();
+            const r = await kineticPreview.capturePreview({
+                cfg, app, layer, company: cfg.company, site,
+                userDataDir: previewSetup(),
+                outFile: path.join(profileRoot(), "_claude", "previews", `${app}__${layer}.png`),
+                width, height,
+            });
+            return { summary: `preview of ${app} / ${layer}${r.settled ? "" : " (page hadn't settled)"}`, ...r };
+        },
+    };
+
+    // Live inline view (MCP App): a preview page kept open headless; the view replays
+    // the user's clicks/keys through live_input and draws the returned JPEG frame.
+    const VIEW_RE = /^[0-9a-f-]{36}$/i;
+    const ACTION_TYPES = new Set(["click", "dblclick", "type", "key", "scroll", "reload", "wait"]);
+
+    ops.live_open = {
+        level: "read", needsClient: false,
+        async run(args) {
+            const app = segArg(args, "app");
+            const layer = segArg(args, "layer");
+            const site = args.site ? segArg(args, "site") : undefined;
+            const width = intArg(args, "width", 600, 2560, 1280);
+            const height = intArg(args, "height", 400, 1600, 760);
+            const cfg = await activeCfg();
+            const r = await kineticPreview.liveOpen({ cfg, app, layer, company: cfg.company, site, userDataDir: previewSetup(), width, height });
+            return { summary: `live preview of ${app} / ${layer}`, app, layer, ...r };
+        },
+    };
+
+    ops.live_input = {
+        level: "read", needsClient: false,
+        async run(args) {
+            const viewId = str(args, "viewId");
+            if (!VIEW_RE.test(viewId)) throw new Error("Bad viewId");
+            const actions = args.actions === undefined ? [] : args.actions;
+            if (!Array.isArray(actions) || actions.length > 50 || actions.some(a => !a || !ACTION_TYPES.has(a.type))) {
+                throw new Error(`actions must be an array (max 50) of ${[...ACTION_TYPES].join("/")}`);
+            }
+            return kineticPreview.liveInput(viewId, actions);
+        },
+    };
+
+    ops.live_close = {
+        level: "read", needsClient: false,
+        async run(args) {
+            const viewId = str(args, "viewId");
+            return { closed: kineticPreview.liveClose(viewId) };
+        },
+    };
+
+    ops.open_preview = {
+        level: "read", needsClient: false,
+        async run(args) {
+            const app = segArg(args, "app");
+            const layer = segArg(args, "layer");
+            const site = args.site ? segArg(args, "site") : undefined;
+            const cfg = await activeCfg();
+            const r = await kineticPreview.openPreviewWindow({ cfg, app, layer, company: cfg.company, site, userDataDir: previewSetup() });
+            return { summary: `opened ${app} / ${layer} in a preview window — reload it (Cmd+R) after save_layer`, ...r };
         },
     };
 

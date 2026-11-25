@@ -1,6 +1,7 @@
 "use strict";
 const https = require("https");
 const http = require("http");
+const { withAuthRetry } = require("./authRetry");
 
 // Client for Ice.LIB.MetaFXSvc — Kinetic app and layer transfer.
 // All operations are POST method calls (same pattern as Ice.LIB.EfxLibraryDesignerSvc).
@@ -34,16 +35,10 @@ class KineticMetaFXClient {
         this.config = config;
     }
 
-    _getHeaders() {
-        const auth = Buffer.from(`${this.config.username}:${this.config.password}`).toString("base64");
-        const headers = {
-            "Content-Type": "application/json",
-            "Authorization": `Basic ${auth}`,
-        };
-        if (this.config.apiKey) {
-            headers["x-api-key"] = this.config.apiKey;
-        }
-        return headers;
+    // Auth headers come from config.authHeaders (auth.js getAuthHeader):
+    // Basic or Bearer, plus x-api-key. A 401 on an Entra profile retries once.
+    _send(send) {
+        return withAuthRetry(this.config, auth => send({ "Content-Type": "application/json", ...auth }));
     }
 
     _methodUrl(method) {
@@ -52,6 +47,10 @@ class KineticMetaFXClient {
     }
 
     _call(method, body) {
+        return this._send(headers => this._callWith(method, body, headers));
+    }
+
+    _callWith(method, body, headers) {
         return new Promise((resolve, reject) => {
             const url = this._methodUrl(method);
             const parsed = new URL(url);
@@ -64,7 +63,7 @@ class KineticMetaFXClient {
                 path: parsed.pathname + parsed.search,
                 method: "POST",
                 headers: {
-                    ...this._getHeaders(),
+                    ...headers,
                     "Content-Length": Buffer.byteLength(bodyStr),
                 },
                 rejectUnauthorized: false,
@@ -89,7 +88,7 @@ class KineticMetaFXClient {
                         }
                         console.error(`[MetaFX] ${method} failed ${res.statusCode}: body=`, data.slice(0, 2000));
                         console.error(`[MetaFX] ${method} request body was:`, bodyStr.slice(0, 1000));
-                        reject(new Error(msg));
+                        reject(Object.assign(new Error(msg), { status: res.statusCode }));
                     }
                 });
             });
@@ -101,13 +100,17 @@ class KineticMetaFXClient {
 
     // GET request — used for endpoints like GetApp that take a 'request' query param
     _get(method, params) {
+        return this._send(headers => this._getWith(method, params, headers));
+    }
+
+    _getWith(method, params, headers) {
         return new Promise((resolve, reject) => {
             const url = this._methodUrl(method);
             const parsed = new URL(url);
             parsed.searchParams.set('request', JSON.stringify(params));
             const isHttps = parsed.protocol === "https:";
             const mod = isHttps ? https : http;
-            const hdrs = this._getHeaders();
+            const hdrs = { ...headers };
             delete hdrs['Content-Type']; // no body on GET
             const options = {
                 hostname: parsed.hostname,
@@ -131,7 +134,7 @@ class KineticMetaFXClient {
                             msg = e.error?.message || e.ErrorMessage || data;
                         } catch { msg = data || msg; }
                         console.error(`[MetaFX] GET ${method} failed ${res.statusCode}:`, data.slice(0, 1000));
-                        reject(new Error(msg));
+                        reject(Object.assign(new Error(msg), { status: res.statusCode }));
                     }
                 });
             });
@@ -331,6 +334,16 @@ class KineticMetaFXClient {
                 layerInfo: this._buildLayerInfo(viewId, meta, false),
             },
         });
+        return result?.returnObj;
+    }
+
+    // SaveApp with a request that's already built (layerContent.toSaveRequest).
+    // Epicor can answer 200 with an error payload, so surface that too.
+    async saveAppRequest(request) {
+        const result = await this._call("SaveApp", { request });
+        const errMsg = result && typeof result === "object"
+            && (result.error?.message || result.ErrorMessage || result.returnObj?.ErrorMessage);
+        if (errMsg) throw new Error(errMsg);
         return result?.returnObj;
     }
 

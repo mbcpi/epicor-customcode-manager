@@ -15,7 +15,9 @@ const crypto = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
-const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
+const { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
+const updater = require("./updater.js");
+const { LIVE_VIEW_URI, LIVE_VIEW_HTML } = require("./liveView.js");
 
 const BRIDGE_FILE = process.env.EFX_BRIDGE_FILE || path.join(os.homedir(), ".efx-manager", "bridge.json");
 const ACK_WAIT_RUNNING_MS = 5000;
@@ -54,7 +56,7 @@ function tool(name, level, description, properties = {}, required = [], timeout 
     };
 }
 const TOOLS = [
-    tool("status", "read", "Active profile, company, connection state and this profile's Claude access level."),
+    tool("status", "read", "Active profile, company, connection state, authType and authState (ok / login-required / n/a for basic), and this profile's Claude access level. On login-required, ask the user to run EFx: Sign In in VS Code — Claude can't sign in."),
     tool("list_libraries", "read", "List every EFx library on the active environment (ID, description, published state, ...)."),
     tool("get_library", "read", "One library: settings, every function with its signature, and its table/service/assembly/library references.",
         { library: S.str("Library ID"), includeCode: S.bool("Also return each function's code (can be large)") }, ["library"]),
@@ -76,6 +78,25 @@ const TOOLS = [
         { profileA: S.str("Profile A"), companyA: S.str("Company in A (default: first)"), profileB: S.str("Profile B"), companyB: S.str("Company in B (default: first)"), kind: { type: "string", enum: ["functions", "bpm"] }, library: S.str("functions only: limit to one library"), includeCode: S.bool("with library: include both sides' code for differing functions") },
         ["profileA", "profileB"], 300000),
 
+    tool("list_layers", "read", "Kinetic layers on one app (unpublished included): name, type, company, draft state, last change.",
+        { app: S.str("App ID, e.g. Erp.UI.SalesOrderEntry or Ice.UIDbd.MyDashboard") }, ["app"]),
+    tool("get_layer", "read", "Pull one layer's content (GetApp, App Studio mode = draft) to <profile>/KineticLayers/<app>/<layer>.json for editing. A local file that differs from the server is kept unless overwrite is true.",
+        { app: S.str("App ID"), layer: S.str("Layer name"), overwrite: S.bool("Replace a local file that differs from the server") }, ["app", "layer"], 180000),
+    tool("preview_layer", "read", "Render the layer's saved draft in real Kinetic (headless Chrome, App Studio preview URL) and return a screenshot. Run after save_layer to check a change.",
+        { app: S.str("App ID"), layer: S.str("Layer name"), site: S.str("Site (default: the user's)"), width: { type: "integer", description: "Viewport width, 600-2560 (default 1440)" }, height: { type: "integer", description: "Viewport height, 400-1600 (default 900)" } }, ["app", "layer"], 120000),
+
+    tool("open_preview", "read", "Open the layer's saved draft, signed in, in a visible Chrome window on the user's machine so they can click through it. Reload that window (Cmd+R) after save_layer to see changes.",
+        { app: S.str("App ID"), layer: S.str("Layer name"), site: S.str("Site (default: the user's)") }, ["app", "layer"], 120000),
+
+    tool("show_live_preview", "read", "Show the layer's saved draft live and clickable inline in the chat (real Kinetic in headless Chrome, streamed as frames). The user can click, type and scroll; its Reload button picks up a new save_layer. To look at it yourself, use preview_layer.",
+        { app: S.str("App ID"), layer: S.str("Layer name"), site: S.str("Site (default: the user's)"), width: { type: "integer", description: "Page width, 600-2560 (default 1280)" }, height: { type: "integer", description: "Page height, 400-1600 (default 760)" } }, ["app", "layer"], 120000),
+    tool("live_input", "read", "View-only: replay clicks/keys/scrolls on a live preview and return a frame.",
+        { viewId: S.str("Live view id"), actions: { type: "array", items: { type: "object" }, description: "click {x,y,count}, dblclick {x,y}, type {text}, key {key,shift}, scroll {x,y,dx,dy}, reload, wait" } }, ["viewId"], 90000),
+    tool("live_close", "read", "View-only: close a live preview.",
+        { viewId: S.str("Live view id") }, ["viewId"], 30000),
+
+    tool("save_layer", "write", "Save the local layer file (from get_layer) to Epicor as a draft (SaveApp, WIP). Never publishes. Backs up the server draft first. Refuses if the layer changed on the server since the pull unless force is true.",
+        { app: S.str("App ID"), layer: S.str("Layer name"), force: S.bool("Save even if the server copy changed since the pull") }, ["app", "layer"], 180000),
     tool("push_functions", "write", "Push local .cs files (from pull) to Epicor. Several functions in one library go in ONE save — one compile, all or nothing; a single function and widget-flow functions push one at a time. Refuses frozen (locked) libraries and files open in VS Code with unsaved edits. Backs up the server version first. Returns per-function ok/errors/diagnostics." + PROMOTED_NOTE,
         { functions: { type: "array", items: { type: "object", properties: { library: S.str("Library ID"), function: S.str("Function ID") }, required: ["library", "function"] } }, allowDemote: S.allowDemote },
         ["functions"]),
@@ -103,25 +124,39 @@ const TOOLS = [
         { target: S.str("Profile to activate"), company: S.str("Company in it") }, ["target"]),
     tool("switch_company", "write", "Change the active company within the active profile.",
         { company: S.str("Company") }, ["company"]),
-    tool("create_profile", "write", "Create a profile. VS Code then asks the user for the password and API key (they never pass through Claude). New profiles start with Claude access off.",
-        { name: S.str("Profile name"), serverUrl: S.str("https://server/instance"), username: S.str("Epicor user"), companies: { type: "array", items: { type: "string" } }, autoPush: S.bool("Auto-push on save"), autoClean: S.bool("Delete local file on close") },
+    tool("create_profile", "write", "Create a profile. VS Code then asks the user for the password (basic only) and API key — they never pass through Claude. Entra profiles need clientId, tenantId and scope, and the user signs in with EFx: Sign In. New profiles start with Claude access off.",
+        { name: S.str("Profile name"), serverUrl: S.str("https://server/instance"), username: S.str("Epicor user ID"), companies: { type: "array", items: { type: "string" } }, autoPush: S.bool("Auto-push on save"), autoClean: S.bool("Delete local file on close"), authType: { type: "string", enum: ["basic", "entra"], description: "basic = Epicor user + password; entra = Microsoft Entra SSO (cloud)" }, clientId: S.str("Entra only: Kinetic native app client ID (GUID)"), tenantId: S.str("Entra only: tenant ID (GUID) or domain"), scope: S.str("Entra only: API scope, e.g. api://<webAppId>/<scopeName>") },
         ["name", "serverUrl", "username", "companies"], 300000),
     tool("update_profile", "write", "Edit a profile's non-secret fields (Claude access can only be changed in VS Code).",
-        { name: S.str("Profile to edit"), newName: S.str("Rename to"), serverUrl: S.str("Server URL"), username: S.str("User"), companies: { type: "array", items: { type: "string" } }, autoPush: S.bool("Auto-push"), autoClean: S.bool("Auto-clean") },
+        { name: S.str("Profile to edit"), newName: S.str("Rename to"), serverUrl: S.str("Server URL"), username: S.str("User"), companies: { type: "array", items: { type: "string" } }, autoPush: S.bool("Auto-push"), autoClean: S.bool("Auto-clean"), authType: { type: "string", enum: ["basic", "entra"], description: "basic = Epicor user + password; entra = Microsoft Entra SSO (cloud)" }, clientId: S.str("Entra only: Kinetic native app client ID (GUID)"), tenantId: S.str("Entra only: tenant ID (GUID) or domain"), scope: S.str("Entra only: API scope, e.g. api://<webAppId>/<scopeName>") },
         ["name"]),
     tool("delete_profile", "write", "Delete a profile and its stored credentials (not the active one).",
         { name: S.str("Profile to delete") }, ["name"]),
-    tool("set_profile_secret", "write", "Ask the user, in VS Code, to type a profile's password or API key.",
+    tool("set_profile_secret", "write", "Ask the user, in VS Code, to type a profile's password or API key. Entra profiles have no password — only kind apiKey.",
         { name: S.str("Profile"), kind: { type: "string", enum: ["password", "apiKey"] } }, ["name"], 300000),
 
     tool("promote_library", "risky", "Promote a library to production.", { library: S.str("Library ID") }, ["library"]),
     tool("demote_library", "risky", "Demote a library from production.", { library: S.str("Library ID") }, ["library"]),
 ];
 const BY_NAME = new Map(TOOLS.map(t => [t.name, t]));
+// show_live_preview opens the inline view; live_input / live_close are only for that view.
+Object.assign(BY_NAME.get("show_live_preview"), { op: "live_open", meta: { ui: { resourceUri: LIVE_VIEW_URI }, "ui/resourceUri": LIVE_VIEW_URI } });
+for (const n of ["live_input", "live_close"]) BY_NAME.get(n).meta = { ui: { visibility: ["app"] } };
 
 const LIST_PROFILES = {
     name: "list_profiles",
-    description: "Profiles configured in the EFx extension: name, server, companies, Claude access level, which one is active. Read locally — no secrets.",
+    description: "Profiles configured in the EFx extension: name, server, companies, auth type (basic / entra), Claude access level, which one is active. Read locally — no secrets.",
+    inputSchema: { type: "object", properties: {} },
+};
+
+const CHECK_UPDATE = {
+    name: "check_update",
+    description: "Check GitHub Releases for a newer EFx MCP server than the one running.",
+    inputSchema: { type: "object", properties: {} },
+};
+const INSTALL_UPDATE = {
+    name: "install_update",
+    description: "Download the newer EFx MCP .mcpb and open it so Claude Desktop installs it. Ask the user first; they restart Claude after.",
     inputSchema: { type: "object", properties: {} },
 };
 
@@ -206,13 +241,13 @@ async function callExtension(t, args, progress) {
     const ackFile = path.join(bridge.requestDir, `${id}.ack.json`);
     const resFile = path.join(bridge.requestDir, `${id}.result.json`);
     const tmp = `${reqFile}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ id, profile: profileName, op: t.name, args: opArgs, createdAt: new Date().toISOString() }, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify({ id, profile: profileName, op: t.op || t.name, args: opArgs, createdAt: new Date().toISOString() }, null, 2));
     fs.renameSync(tmp, reqFile);
 
     let acked = pidAlive(bridge.pid) && await waitForFile(ackFile, ACK_WAIT_RUNNING_MS);
     if (!acked) {
         const scheme = bridge.uriScheme || process.env.EFX_URI_SCHEME || "vscode";
-        await openUri(`${scheme}://${bridge.extensionId || "micah-bragg.epicor-efx-manager"}/request?id=${id}`);
+        await openUri(`${scheme}://${bridge.extensionId || "cpi.epicor-efx-manager"}/request?id=${id}`);
         acked = await waitForFile(ackFile, ACK_WAIT_LAUNCH_MS);
     }
     if (!acked) {
@@ -236,22 +271,33 @@ BY_NAME.get("push_directives").timeout = a => 60000 + 30000 * ((a.files || []).l
 
 // ─── server ──────────────────────────────────────────────────────────────────
 
-const server = new Server({ name: "efx-manager", version: require("./package.json").version }, { capabilities: { tools: {} } });
+const server = new Server({ name: "efx-manager", version: require("./package.json").version }, { capabilities: { tools: {}, resources: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [LIST_PROFILES, ...TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))],
+    tools: [LIST_PROFILES, CHECK_UPDATE, INSTALL_UPDATE, ...TOOLS.map(({ name, description, inputSchema, meta }) => ({ name, description, inputSchema, ...(meta ? { _meta: meta } : {}) }))],
 }));
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [{ uri: LIVE_VIEW_URI, name: "Kinetic live preview", mimeType: "text/html;profile=mcp-app" }],
+}));
+server.setRequestHandler(ReadResourceRequestSchema, async req => {
+    if (req.params.uri !== LIVE_VIEW_URI) throw new Error(`Unknown resource ${req.params.uri}`);
+    return { contents: [{ uri: LIVE_VIEW_URI, mimeType: "text/html;profile=mcp-app", text: LIVE_VIEW_HTML,
+        _meta: { ui: { csp: { resourceDomains: ["https://unpkg.com"] }, prefersBorder: true } } }] };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = req.params.name;
     const args = req.params.arguments || {};
     const text = obj => ({ content: [{ type: "text", text: typeof obj === "string" ? obj : JSON.stringify(obj, null, 2) }] });
     try {
+        if (name === "check_update") return text(await updater.checkForUpdate());
+        if (name === "install_update") return text(await updater.installUpdate());
         if (name === "list_profiles") {
             const b = readBridge();
             return text({
                 activeProfile: b.activeProfile, activeCompany: b.activeCompany,
-                profiles: (b.profiles || []).map(p => ({ name: p.name, serverUrl: p.serverUrl, companies: p.companies, claudeAccess: p.claudeAccess, active: p.name === b.activeProfile })),
+                profiles: (b.profiles || []).map(p => ({ name: p.name, serverUrl: p.serverUrl, companies: p.companies, authType: p.authType || "basic", claudeAccess: p.claudeAccess, active: p.name === b.activeProfile })),
                 vscodeRunning: pidAlive(b.pid),
             });
         }
@@ -264,6 +310,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
             ? () => extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message: "waiting for VS Code" } }).catch(() => {})
             : null;
         const result = await callExtension(t, args, progress);
+        if (!result.ok && (name === "show_live_preview" || name === "live_input" || name === "live_close")) {
+            return { ...text(result.error || "failed"), isError: true };
+        }
+        if (name === "show_live_preview") {
+            const r = result.result;
+            return {
+                content: [{ type: "text", text: `Live preview of ${r.app} / ${r.layer} is open inline. The user can click, type and scroll in it; its Reload button picks up a new save_layer.` }],
+                structuredContent: { viewId: r.viewId, profile: args.profile, app: r.app, layer: r.layer, width: r.width, height: r.height, title: r.title },
+            };
+        }
+        if (name === "live_input" || name === "live_close") {
+            return { content: [{ type: "text", text: (result.result && result.result.title) || "ok" }], structuredContent: result.result };
+        }
+        if (name === "preview_layer" && result.ok && result.result && result.result.image) {
+            const png = fs.readFileSync(result.result.image);
+            return { content: [{ type: "image", data: png.toString("base64"), mimeType: "image/png" }, ...text(result).content] };
+        }
         return { ...text(result), isError: !result.ok };
     } catch (e) {
         return { ...text(e.message || String(e)), isError: true };
@@ -275,6 +338,7 @@ if (require.main === module || process.env.EFX_MCP_NO_AUTOSTART !== "1") {
         console.error("efx-mcp failed to start:", e);
         process.exit(1);
     });
+    updater.installUpdate().catch(() => {}); // on start: if GitHub has a newer .mcpb, open it so Claude Desktop prompts to install
 }
 
 module.exports = { TOOLS, callExtension, readBridge };
