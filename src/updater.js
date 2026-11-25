@@ -16,6 +16,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.registerUpdateCommand = registerUpdateCommand;
 exports.checkForUpdatesOnStartup = checkForUpdatesOnStartup;
+exports.mcpOutdated = mcpOutdated;
 
 const vscode = __importStar(require("vscode"));
 const https = __importStar(require("https"));
@@ -93,6 +94,44 @@ function downloadFile(url, destPath, redirectsLeft = 5) {
         req.on('error', err => { fs.unlink(destPath, () => {}); reject(err); });
         req.setTimeout(60000, () => { req.destroy(); reject(new Error('Download timed out')); });
     });
+}
+
+// ── Claude MCP: notice when Claude Desktop runs an older EFx MCP ──
+// The MCP stamps mcpVersion on every bridge request (1.0.9+); older ones send
+// none. Releases ship extension + MCP at the same version, so anything older
+// than this extension is out of date. Prompts once per VS Code session.
+let mcpPrompted = false;
+function mcpOutdated(context, mcpVersion) {
+    const mine = context.extension && context.extension.packageJSON && context.extension.packageJSON.version;
+    if (!mine) return null;
+    if (mcpVersion && !isNewer(mcpVersion, mine)) return null;
+    const theirs = mcpVersion ? `v${mcpVersion}` : 'an older version';
+    if (!mcpPrompted) {
+        mcpPrompted = true;
+        vscode.window.showWarningMessage(
+            `EFx: Claude's EFx MCP server is ${theirs}; this extension is v${mine}. Install the matching MCP for Claude Desktop.`,
+            'Install update', 'Later'
+        ).then(async choice => {
+            if (choice !== 'Install update') return;
+            try { await installMcp(); }
+            catch (e) { vscode.window.showErrorMessage(`EFx: MCP update failed — ${e.message}`); }
+        });
+    }
+    return `The EFx MCP server Claude is using is ${theirs}, older than the VS Code extension (v${mine}). Tell the user to update it: click "Install update" in VS Code, or download the .mcpb from the latest GitHub release and open it, then restart Claude Desktop.`;
+}
+
+// Download the latest release's .mcpb and open it — Claude Desktop asks to install.
+async function installMcp() {
+    const data = await fetchJson(RELEASES_API);
+    const asset = (data.assets || []).find(a => a.name && a.name.endsWith('.mcpb'));
+    if (!asset) throw new Error('No .mcpb in the latest GitHub release');
+    const dest = path.join(os.tmpdir(), asset.name);
+    await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `EFx: Downloading ${asset.name}...`, cancellable: false },
+        () => downloadFile(asset.browser_download_url, dest)
+    );
+    await vscode.env.openExternal(vscode.Uri.file(dest));
+    vscode.window.showInformationMessage('EFx: Claude Desktop should ask to install the MCP update. Restart Claude Desktop afterwards.');
 }
 
 // ── Core: fetch latest release info from GitHub ──

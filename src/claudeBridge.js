@@ -34,6 +34,7 @@ const BRIDGE_FILE = path.join(BRIDGE_DIR, "bridge.json");
 const REQUEST_DIR = "_claude";
 const EXTENSION_ID = "cpi.epicor-efx-manager"; // fallback; the live id comes from context.extension
 const auth = require("./auth");
+const updater = require("./updater");
 
 function levelOf(profile) {
     const v = profile && profile.claudeAccess;
@@ -231,12 +232,15 @@ class ClaudeBridge {
         } catch (e) {
             outcome = { ok: false, error: e.message || String(e), ...(e.needsDemote ? { needsDemote: e.needsDemote } : {}) };
         }
+        let mcpNotice = null;
+        try { mcpNotice = updater.mcpOutdated(this.context, req && req.mcpVersion); } catch { /* never block a request on this */ }
         const result = {
             id,
             profile: req && req.profile,
             op: req && req.op,
             finishedAt: new Date().toISOString(),
             ...outcome,
+            ...(mcpNotice ? { mcpUpdate: mcpNotice } : {}),
         };
         try { writeJsonAtomic(path.join(dir, `${id}.result.json`), result); }
         catch (e) { console.error("EFx Claude bridge: result write failed", e); }

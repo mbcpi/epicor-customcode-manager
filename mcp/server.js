@@ -241,7 +241,7 @@ async function callExtension(t, args, progress) {
     const ackFile = path.join(bridge.requestDir, `${id}.ack.json`);
     const resFile = path.join(bridge.requestDir, `${id}.result.json`);
     const tmp = `${reqFile}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ id, profile: profileName, op: t.op || t.name, args: opArgs, createdAt: new Date().toISOString() }, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify({ id, profile: profileName, op: t.op || t.name, args: opArgs, createdAt: new Date().toISOString(), mcpVersion: require("./package.json").version }, null, 2));
     fs.renameSync(tmp, reqFile);
 
     let acked = pidAlive(bridge.pid) && await waitForFile(ackFile, ACK_WAIT_RUNNING_MS);
